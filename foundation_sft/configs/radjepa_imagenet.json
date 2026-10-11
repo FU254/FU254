@@ -1,0 +1,16 @@
+{
+  "base_config": "radjepa.json",
+  "output_root": "runs/foundation_sft_imagenet",
+  "preprocessing": {
+    "image_size": 224,
+    "mean": [0.485, 0.456, 0.406],
+    "std": [0.229, 0.224, 0.225],
+    "resize_mode": "resize",
+    "interpolation": "bicubic"
+  },
+  "preprocessing_reference": {
+    "status": "research_choice_not_author_confirmed",
+    "normalization_source": "https://github.com/facebookresearch/ijepa/blob/52c1ae95d05f743e000e8f10a1f3a79b10cff048/src/transforms.py",
+    "description": "Explicit downstream experiment setting: upstream I-JEPA default ImageNet statistics with direct bicubic resize to 224. The actual RadJEPA pretraining normalization and resize policy are not confirmed."
+  }
+}

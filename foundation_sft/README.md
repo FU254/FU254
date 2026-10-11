@@ -71,7 +71,7 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --mode
 
 本地目录 `D:\99\EVA-X-main\foundation_weights` 通过 PyCharm 的 **Deployment → Upload** 上传到 `/home/cfu/EVA-X-main/foundation_weights`。同步代码时同时上传整个 `foundation_sft`，避免只更新 `train.py` 而漏掉适配器和公共预处理代码。RAD-DINO 与 CXformer 可沿用 `evax_lora`，先分别运行 `--action smoke`；CXformer 现在会按发布配置执行直方图均衡化。
 
-RadJEPA 的官方自定义 `from_pretrained` 总会联网；新适配器直接读取已下载的 `.pth.tar`，不调用该方法。其输入尺寸已确认是 224，作者发布未给出归一化均值、标准差，默认仍留空并明确报错，需先按核实过的实验规范填写。RadJEPA 的 timm 依赖与 EVA-X 不同，按来源说明使用单独环境。
+RadJEPA 的官方自定义 `from_pretrained` 总会联网；新适配器直接读取已下载的 `.pth.tar`，不调用该方法。其输入尺寸已确认是 224，作者发布未给出归一化均值、标准差，默认仍留空并明确报错。若先采用明确的研究设置做计算验证和探索训练，可选择 `configs/radjepa_imagenet.json`，使用官方 I-JEPA 上游默认的 ImageNet 统计值，并记录为本研究选择，**不宣称已核实为 RadJEPA 作者的预训练规范**。该配置使用独立结果目录；详见来源说明中的依据及作者规范获取入口。RadJEPA 的 timm 依赖与 EVA-X 不同，按来源说明使用单独环境。
 
 默认 `common.json` 设置微批次 8、累积 8，约相当于有效批次 64。大模型高分辨率输入可能需要更小微批次；显存不足时可改为 `batch_size: 1`、`accumulation_steps: 64`，其余设置保持一致。最后一个不完整累积窗口按实际样本数归一化。
 

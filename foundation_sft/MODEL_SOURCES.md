@@ -93,7 +93,9 @@ PY
 - 默认 `backend: "hf"`，`checkpoint` 填完整本地目录。用户从官方发布下载的文件是 `config.json`、`modeling_radjepa.py`、`jepa_encoder.pth.tar` 和模型说明，没有标准 `.bin` / `.safetensors` 权重，也没有 `preprocessor_config.json`。
 - 已核对这次发布的源码：使用 `timm` ViT-B，替换为 14 像素 patch，去掉 CLS，输入 224；官方 `from_pretrained` 会再次调用 `hf_hub_download`，即使传入本地目录也不能满足离线要求。适配器只从本地加载配置和模型类、直接构造架构，再严格加载 `jepa_encoder.pth.tar` 中的 `encoder` 或 `state_dict.encoder`；不会调用这个联网方法。标准 HF 权重格式仍然支持，目录同时出现多种格式时会要求明确整理。
 - `allow_remote_code: true` 表示允许构造已审阅的本地模型类；默认配置现已开启，用于上面核对过的发布。以后更新作者源码时应重新核对。外部模块引用会被拒绝；源码和权重指纹随训练记录。若模型同时含多个编码器，需要明确配置 `encoder_path`。
-- 输入尺寸 `preprocessing.image_size` 已按这次 `config.json` 填为 **224**。**作者这次发布和 README 没有给出归一化均值、标准差，所以 `mean` / `std` 仍留空，正式运行前必须填写经过核实的数值。** 程序会明确报告这个缺项，不能把下载完成当作已可训练。若另一发布包含完整的 processor 元数据，也可自动读取；不会借用其他模型的归一化。
+- 输入尺寸 `preprocessing.image_size` 已按这次 `config.json` 填为 **224**。**作者这次发布和 README 没有给出归一化均值、标准差，所以默认 `radjepa.json` 的 `mean` / `std` 仍留空。** 若目标是采用作者规范，应先核实这些参数；若采用本研究自己的下游预处理，则应明确选择并记录，下面提供了独立实验配置。若另一发布包含完整的 processor 元数据，也可自动读取；默认配置不会自动填入其他模型的归一化。
+- 获取作者规范的入口是上面的官方模型卡、GitHub 仓库，以及论文 [arXiv:2601.15891](https://arxiv.org/abs/2601.15891)。若论文及补充材料仍未说明，可在 [官方 GitHub Issues](https://github.com/aidelab-iitbombay/RadJEPA/issues) 向作者询问输入像素范围、归一化均值/标准差、resize/crop、插值及是否采用直方图均衡化。它们是数值和处理规范，不是另一份权重文件。
+- 如果先按明确的下游实验规范试运行，使用单独的 **`configs/radjepa_imagenet.json`**：224 输入、直接 bicubic resize、ImageNet mean `[0.485, 0.456, 0.406]` / std `[0.229, 0.224, 0.225]`。统计值取自 [官方 I-JEPA `make_transforms` 默认参数](https://github.com/facebookresearch/ijepa/blob/52c1ae95d05f743e000e8f10a1f3a79b10cff048/src/transforms.py)，RadJEPA README 确认使用 I-JEPA 训练代码，**但未确认保留这些默认值**，resize 规则也属于本研究的显式选择。因此此配置不宣称复现作者预处理；选择它就能开展真实权重的计算验证和探索训练。配置中的 `preprocessing_reference` 与实际参数会随结果保存，结果另存于 `runs/foundation_sft_imagenet`，公共患者划分仍保持一致。默认 `radjepa.json` 继续留空，待取得作者规范后填写。
 - 官方说明建议 `timm==1.0.24`。EVA-X 使用 `timm==0.4.12`，建议为 RadJEPA 单独建环境，保留现有可运行环境：
 
 ```bash
@@ -103,10 +105,9 @@ unset LD_LIBRARY_PATH
 python -m pip install -r foundation_sft/requirements-hf.txt
 python -m pip install --no-deps timm==1.0.24
 python -m pip check
-python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id="AIDELab-IITBombay/RadJEPA", local_dir="foundation_weights/radjepa")
-PY
+# 在项目根目录执行，使用已经下载并上传的官方权重。
+# 此处选用明确标注的 ImageNet 实验配置；计算验证不等同于复现论文指标。
+python -m foundation_sft.train --config foundation_sft/configs/radjepa_imagenet.json --action smoke --device cuda:3
 ```
 
 克隆环境需要磁盘空间和目录写权限。若 `pip check` 或官方源码提示缺少额外依赖，按实际错误补齐，随后重新检查 Torch 和 `smoke`。不要在这个新环境中运行依赖旧 timm 的 EVA-X 脚本。
