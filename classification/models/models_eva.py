@@ -246,19 +246,9 @@ class Attention(nn.Module):
             x = x.reshape(B, N, -1)
             x = self.proj(x)
             x = self.proj_drop(x)
-        elif self.xattn and (not XFORMERS_AVAILABLE or not q.is_cuda):
-            # Fallback to standard attention when xformers is not available or on CPU
-            q = q.permute(0, 2, 1, 3)   # B, num_heads, N, C -> B, N, num_heads, C
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            
-            # Standard attention implementation
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = attn.softmax(dim=-1)
-            x = (attn @ v).reshape(B, N, -1)
-            x = self.proj(x)
-            x = self.proj_drop(x)
         else:
+            # Native attention, including the CPU/xformers-unavailable fallback.
+            # Keep [B, num_heads, N, head_dim] so attention mixes tokens, not heads.
             q = q * self.scale
             if self.qk_float:
                 attn = (q.float() @ k.float().transpose(-2, -1))
