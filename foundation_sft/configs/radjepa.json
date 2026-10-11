@@ -1,0 +1,12 @@
+{
+  "base_config": "common.json",
+  "model": "radjepa",
+  "backend": "hf",
+  "checkpoint": "foundation_weights/radjepa",
+  "allow_remote_code": false,
+  "preprocessing": {
+    "image_size": null,
+    "mean": null,
+    "std": null
+  }
+}

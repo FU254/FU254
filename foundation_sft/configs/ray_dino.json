@@ -1,0 +1,12 @@
+{
+  "base_config": "common.json",
+  "model": "ray_dino",
+  "backend": "native",
+  "repo_dir": "foundation_sources/dinov2",
+  "checkpoint": "foundation_weights/ray_dino/xray_dino_vitl16.pth",
+  "preprocessing": {
+    "image_size": 512,
+    "mean": null,
+    "std": null
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "base_config": "common.json",
+  "model": "eva_x",
+  "checkpoint": "eva_x_base_patch16_merged520k_mim.pt",
+  "pooling": "patch_mean"
+}

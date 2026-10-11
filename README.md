@@ -1,3 +1,5 @@
+六个基础模型的监督训练代码和 PyCharm/SSH 使用步骤见 [foundation_sft/README.md](foundation_sft/README.md)，官方模型权重准备见 [MODEL_SOURCES.md](foundation_sft/MODEL_SOURCES.md)。
+
 <div align="center">
 
 #  <img src="figs/logo.png" height="28"> *EVA-X*

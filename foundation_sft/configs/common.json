@@ -1,0 +1,50 @@
+{
+  "mode": "lora",
+  "device": "cuda:3",
+  "seed": 42,
+  "output_root": "runs/foundation_sft",
+  "split_manifest": "runs/foundation_sft/shared_patient_split.csv",
+  "split_seed": 42,
+  "split_ratios": [
+    0.7,
+    0.1,
+    0.2
+  ],
+  "data": {
+    "excel_path": "/home/cfu/肺功能万能表最终版1_fev1fvc差值标签(1).xlsx",
+    "dicom_dir": "/data/users/cfu/DR数据_按文件10份-筛选合成",
+    "label_column": "阻塞性通气障碍",
+    "accession_column": "放射编号",
+    "patient_column": "auto",
+    "patient_id_source": "auto",
+    "dicom_patient_fallback": true,
+    "allow_name_patient_id": false,
+    "label_definition": "Existing Excel obstruction label; confirm LLN reference equation and bronchodilator status before formal analysis"
+  },
+  "training": {
+    "epochs": 300,
+    "patience": 30,
+    "batch_size": 8,
+    "accumulation_steps": 8,
+    "num_workers": 4,
+    "head_lr": 0.0001,
+    "lora_lr": 0.0001,
+    "weight_decay": 0.0001,
+    "minimum_lr": 1e-07,
+    "focal_gamma": 2.0,
+    "focal_scale": 0.8,
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "hidden_dims": [
+      384,
+      192
+    ],
+    "amp": true,
+    "gradient_clip": 1.0,
+    "horizontal_flip_probability": 0.0,
+    "rotation_degrees": 10.0
+  },
+  "evaluation": {
+    "bootstrap_samples": 1000
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "base_config": "common.json",
+  "model": "rad_dino",
+  "model_dir": "foundation_weights/rad_dino",
+  "checkpoint_source": "microsoft/rad-dino"
+}

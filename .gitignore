@@ -19,3 +19,18 @@ segmentation/ops/build
 *syh*
 reproduce
 *__pycache__*
+
+# Local training outputs and external model assets
+__pycache__/
+*.py[cod]
+/runs/
+/foundation_weights/
+/foundation_sources/
+*.pt
+*.pth
+*.safetensors
+*.npz
+*.dcm
+*.xlsx
+.env
+.env.*
