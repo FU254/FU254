@@ -74,6 +74,7 @@ git -C foundation_sources/CheXFound checkout 7e288d06532f24abedb7d00781185c36727
 - 发布使用内置 `Dinov2WithRegistersModel`：patch14、4 个 register token、12 层；Base 为 768 通道、Small 为 384 通道，发布输入为 518。精确预处理读取本地 processor。
 - 默认 `configs/cxformer.json` 使用 Base。切换 Small 时同时更改 `variant`、`checkpoint_source` 和 `model_dir`。
 - LoRA 注入逐层 Q/K/V；空间特征排除 CLS 和 register token。
+- 实际发布的 `preprocessor_config.json` 使用 `CustomBitImageProcessor`，并启用 `do_hist_equalization: true`。作者先对 uint8 图像逐通道做 OpenCV 等价的直方图均衡化，再缩放、裁剪和归一化。适配器直接解析本地配置并复现这个流程，不需要执行 `custom_processor.py`；均衡化开关记录在模型预处理指纹中。
 
 ```bash
 python - <<'PY'
@@ -89,9 +90,10 @@ PY
 - 官方仓库：[aidelab-iitbombay/RadJEPA](https://github.com/aidelab-iitbombay/RadJEPA)，核对版本 `5f490ab58295a403ae6f29aa304db43a2aded423`。
 - 官方模型：[AIDELab-IITBombay/RadJEPA](https://huggingface.co/AIDELab-IITBombay/RadJEPA)。GitHub 仓库主要提供说明，实际实现随 Hugging Face 模型目录的自定义 Python 文件发布。
 - 核对目标编码器 ViT-B/14、768 通道、12 层和 12 个 fused QKV 投影。取编码器空间 patch token，均值作为全局特征。
-- 默认 `backend: "hf"`，`checkpoint` 填完整本地目录，包括权重、`config.json`、自定义 `.py`、其依赖文件和 processor 元数据。
-- 本地源码核对完成后，在 JSON 将 `allow_remote_code` 设为 `true`，以使用作者要求的自定义模型类。这只从本地加载；外部代码引用会被拒绝。若模型同时含多个编码器，需要明确配置 `encoder_path`。
-- 如果完整 `preprocessor_config.json` 含尺寸、resize/crop、归一化、rescale 和插值规范，自动读取；否则根据官方模型说明明确填写 `preprocessing.image_size/mean/std`，图像尺寸须为 14 的倍数。当前没有猜测这些数值。
+- 默认 `backend: "hf"`，`checkpoint` 填完整本地目录。用户从官方发布下载的文件是 `config.json`、`modeling_radjepa.py`、`jepa_encoder.pth.tar` 和模型说明，没有标准 `.bin` / `.safetensors` 权重，也没有 `preprocessor_config.json`。
+- 已核对这次发布的源码：使用 `timm` ViT-B，替换为 14 像素 patch，去掉 CLS，输入 224；官方 `from_pretrained` 会再次调用 `hf_hub_download`，即使传入本地目录也不能满足离线要求。适配器只从本地加载配置和模型类、直接构造架构，再严格加载 `jepa_encoder.pth.tar` 中的 `encoder` 或 `state_dict.encoder`；不会调用这个联网方法。标准 HF 权重格式仍然支持，目录同时出现多种格式时会要求明确整理。
+- `allow_remote_code: true` 表示允许构造已审阅的本地模型类；默认配置现已开启，用于上面核对过的发布。以后更新作者源码时应重新核对。外部模块引用会被拒绝；源码和权重指纹随训练记录。若模型同时含多个编码器，需要明确配置 `encoder_path`。
+- 输入尺寸 `preprocessing.image_size` 已按这次 `config.json` 填为 **224**。**作者这次发布和 README 没有给出归一化均值、标准差，所以 `mean` / `std` 仍留空，正式运行前必须填写经过核实的数值。** 程序会明确报告这个缺项，不能把下载完成当作已可训练。若另一发布包含完整的 processor 元数据，也可自动读取；不会借用其他模型的归一化。
 - 官方说明建议 `timm==1.0.24`。EVA-X 使用 `timm==0.4.12`，建议为 RadJEPA 单独建环境，保留现有可运行环境：
 
 ```bash

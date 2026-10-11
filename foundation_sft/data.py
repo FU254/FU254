@@ -282,6 +282,32 @@ def _spec_value(spec, name, default=None):
     return spec.get(name, default) if isinstance(spec, dict) else getattr(spec, name, default)
 
 
+def _equalize_histogram_uint8(pixels):
+    """Match OpenCV equalizeHist on uint8 grayscale or each RGB channel.
+
+    Subtract the first occupied bin, preserve constant images, and round the
+    float32 CDF mapping to nearest-even as OpenCV's saturate_cast does. Keeping
+    this operation local avoids importing snapshot-provided processor code or
+    requiring OpenCV for training.
+    """
+    pixels = np.asarray(pixels)
+    if pixels.dtype != np.uint8 or pixels.ndim not in (2, 3) or not pixels.size:
+        raise ValueError("Histogram equalization requires a nonempty uint8 image")
+    if pixels.ndim == 3:
+        if pixels.shape[-1] != 3:
+            raise ValueError("Histogram equalization expects RGB channels last")
+        return np.stack([_equalize_histogram_uint8(pixels[..., channel]) for channel in range(3)], axis=-1)
+    histogram = np.bincount(pixels.reshape(-1), minlength=256)
+    first = int(np.flatnonzero(histogram)[0])
+    count = int(histogram[first])
+    if count == pixels.size:
+        return pixels.copy()
+    cumulative = np.cumsum(histogram, dtype=np.int64) - count
+    scale = np.float32(255.0) / np.float32(pixels.size - count)
+    lookup = np.clip(np.rint(cumulative.astype(np.float32) * scale), 0, 255).astype(np.uint8)
+    return lookup[pixels]
+
+
 def _resize_image(pixels, preprocess):
     size = int(_spec_value(preprocess, "image_size"))
     if size < 1:
@@ -298,6 +324,12 @@ def _resize_image(pixels, preprocess):
     }
     if interpolation not in resamplers:
         raise ValueError("Unsupported image interpolation setting.")
+    equalize = _spec_value(preprocess, "do_hist_equalization", False)
+    if equalize:
+        # The reviewed CXformer processor consumes uint8 input and resizes the
+        # equalized uint8 image before rescaling. Quantize the common display
+        # intensities once here; other encoders keep the original float path.
+        pixels = _equalize_histogram_uint8((np.clip(pixels, 0.0, 1.0) * 255.0).astype(np.uint8))
     image = Image.fromarray(pixels)
     width, height = image.size
     resample = resamplers[interpolation]
@@ -316,12 +348,15 @@ def _resize_image(pixels, preprocess):
     elif mode == "letterbox":
         factor = size / max(width, height)
         resized = image.resize((max(1, round(width * factor)), max(1, round(height * factor))), resample=resample)
-        canvas = Image.new("F", (size, size), 0.0)
+        canvas = Image.new(image.mode, (size, size), 0)
         canvas.paste(resized, ((size - resized.width) // 2, (size - resized.height) // 2))
         image = canvas
     else:
         raise ValueError("resize_mode must be resize, letterbox, or shortest_edge_center_crop.")
-    return np.clip(np.asarray(image, dtype=np.float32), 0.0, 1.0)
+    result = np.asarray(image, dtype=np.float32)
+    if equalize:
+        result = result / 255.0
+    return np.clip(result, 0.0, 1.0)
 
 
 class CXRDataset(Dataset):

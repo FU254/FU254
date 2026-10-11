@@ -56,7 +56,7 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --mode
 
 ## 其他五个模型
 
-权重和依赖准备方法见 [MODEL_SOURCES.md](MODEL_SOURCES.md)。目前只确认了你已有 EVA-X Base，其他模型的权重需要逐一核对或下载。准备完成后，替换命令中的配置文件即可：
+权重和依赖准备方法见 [MODEL_SOURCES.md](MODEL_SOURCES.md)。目前你已有 EVA-X Base，已在 Windows 电脑下载 RAD-DINO、CXformer Base、RadJEPA 的官方完整目录；还需要上传服务器并逐个验证。准备完成后，替换命令中的配置文件即可：
 
 | 模型 | 配置 | 必需的本地资产 |
 |---|---|---|
@@ -65,9 +65,13 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --mode
 | RayDINO / XRay-DINO | `configs/ray_dino.json` | 官方 DINOv2 源码、RayDINO `.pth`、核实后的归一化参数 |
 | CheXFound | `configs/chexfound.json` | 官方源码及 YAML、ViT-L/16 teacher 权重 |
 | CXformer Base | `configs/cxformer.json` | 官方完整 Hugging Face 模型目录；也支持 Small |
-| RadJEPA | `configs/radjepa.json` | 官方完整模型目录和自定义源码；完整预处理配置 |
+| RadJEPA | `configs/radjepa.json` | 官方完整目录（`jepa_encoder.pth.tar` 和源码）；核实后的归一化均值、标准差 |
 
 六个适配器都已经实现。缺少权重、预处理参数或不匹配的编码器参数会报错。训练入口不会自动下载模型，也不会用随机权重继续正式训练。
+
+本地目录 `D:\99\EVA-X-main\foundation_weights` 通过 PyCharm 的 **Deployment → Upload** 上传到 `/home/cfu/EVA-X-main/foundation_weights`。同步代码时同时上传整个 `foundation_sft`，避免只更新 `train.py` 而漏掉适配器和公共预处理代码。RAD-DINO 与 CXformer 可沿用 `evax_lora`，先分别运行 `--action smoke`；CXformer 现在会按发布配置执行直方图均衡化。
+
+RadJEPA 的官方自定义 `from_pretrained` 总会联网；新适配器直接读取已下载的 `.pth.tar`，不调用该方法。其输入尺寸已确认是 224，作者发布未给出归一化均值、标准差，默认仍留空并明确报错，需先按核实过的实验规范填写。RadJEPA 的 timm 依赖与 EVA-X 不同，按来源说明使用单独环境。
 
 默认 `common.json` 设置微批次 8、累积 8，约相当于有效批次 64。大模型高分辨率输入可能需要更小微批次；显存不足时可改为 `batch_size: 1`、`accumulation_steps: 64`，其余设置保持一致。最后一个不完整累积窗口按实际样本数归一化。
 
@@ -123,9 +127,11 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --acti
 
 ## 已完成的验证
 
-云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 54 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向。
+云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 68 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。
 
 另外，RayDINO 官方 `xray_dino_vitl16` 完整 ViT-L/16 架构已用随机初始化和小尺寸合成输入完成 24 层 LoRA 前向、反向、冻结参数及重载一致性检查。这些检查不代表已加载医学预训练权重，也不代表已经在你的 SSH 服务器完成训练。
+
+RadJEPA 已按用户提供的官方模型源码，在隔离的 `timm==1.0.24` 环境构造完整 85,704,960 参数 ViT-B/14、224 输入，并用合成的本地 encoder checkpoint 完成 LP 和 12 层 LoRA 前向、反向、冻结参数及重载一致性检查；检查期间禁止 Hub 和 HTTP 请求。此检查使用明确的测试归一化，不能作为作者预训练归一化参数的依据，也没有验证用户实际下载的医学权重。
 
 ```bash
 MPLBACKEND=Agg OMP_NUM_THREADS=2 python -m unittest discover -s tests -p 'test_*.py' -v

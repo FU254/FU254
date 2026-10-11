@@ -3,9 +3,9 @@
   "model": "radjepa",
   "backend": "hf",
   "checkpoint": "foundation_weights/radjepa",
-  "allow_remote_code": false,
+  "allow_remote_code": true,
   "preprocessing": {
-    "image_size": null,
+    "image_size": 224,
     "mean": null,
     "std": null
   }

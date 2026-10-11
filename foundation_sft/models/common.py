@@ -18,12 +18,15 @@ class PreprocessSpec:
     resize_mode: str = "resize"
     resize_shortest_edge: int | None = None
     interpolation: str = "bicubic"
+    do_hist_equalization: bool = False
 
     def __post_init__(self):
         if isinstance(self.image_size, bool) or not isinstance(self.image_size, int) or self.image_size <= 0 or len(self.mean) != 3 or len(self.std) != 3:
             raise ValueError("Preprocessing needs a positive image size and three-channel statistics")
         if any(not math.isfinite(v) for v in tuple(self.mean) + tuple(self.std)) or any(v <= 0 for v in self.std):
             raise ValueError("Normalization statistics must be finite with positive standard deviation")
+        if not isinstance(self.do_hist_equalization, bool):
+            raise ValueError("do_hist_equalization must be a boolean")
 
 
 @dataclass

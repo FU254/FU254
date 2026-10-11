@@ -1,8 +1,10 @@
 """Local, strictly loaded RadJEPA ViT-B/14 encoders.
 
-The authors publish a Hugging Face custom-code model, rather than a Python
-implementation in their GitHub repository.  ``hf`` therefore loads a reviewed
-local snapshot using their documented AutoModel API.  ``ijepa`` supports an
+The authors publish a Hugging Face custom-code model whose loader always calls
+the Hub, even for a local directory.  ``hf`` constructs the reviewed local
+classes directly for their ``jepa_encoder.pth.tar`` release, then strictly loads
+the encoder without calling that loader.  Standard HF weight exports are also
+supported.  ``ijepa`` supports an
 encoder-only export in the official I-JEPA state-dict format; it does not assume
 that the Hugging Face weights have that format.
 
@@ -17,7 +19,8 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from uuid import uuid4
 
 import torch
 from torch import nn
@@ -29,6 +32,7 @@ from .common import (BackboneAdapter, BackboneFeatures, PreprocessSpec,
 OFFICIAL_MODEL_ID = "AIDELab-IITBombay/RadJEPA"
 OFFICIAL_REPOSITORY = "https://github.com/aidelab-iitbombay/RadJEPA"
 IJEPA_REPOSITORY = "https://github.com/facebookresearch/ijepa"
+OFFICIAL_CHECKPOINT_NAME = "jepa_encoder.pth.tar"
 
 
 def _pair(value):
@@ -39,14 +43,26 @@ def _pair(value):
 
 def _preprocessing(config):
     """Require recorded settings instead of guessing unverified normalization."""
-    values = config.get("preprocessing", config)
+    values = dict(config.get("preprocessing", config))
+    checkpoint = Path(config.get("checkpoint") or "").expanduser().resolve()
+    recorded_size = None
+    model_config_file = checkpoint / "config.json"
+    if (values.get("image_size") is None and config.get("backend", "hf") == "hf"
+            and model_config_file.is_file()):
+        metadata = json.loads(model_config_file.read_text(encoding="utf-8"))
+        if not isinstance(metadata, dict):
+            raise ValueError("RadJEPA config.json must be a JSON object")
+        recorded_size = metadata.get("image_size")
+        if recorded_size is not None:
+            values["image_size"] = recorded_size
     missing = [key for key in ("image_size", "mean", "std") if values.get(key) is None]
     if missing:
-        checkpoint = Path(config.get("checkpoint") or "").expanduser().resolve()
         processor_file = checkpoint / "preprocessor_config.json"
         if config.get("backend", "hf") != "hf" or not processor_file.is_file():
+            detail = (f" The snapshot records image_size={recorded_size}, but does not provide "
+                      "normalization mean/std." if recorded_size is not None else "")
             raise ValueError("RadJEPA requires verified preprocessing settings: " + ", ".join(missing)
-                             + ". Supply a complete local preprocessor_config.json or record the "
+                             + "." + detail + " Supply a complete local preprocessor_config.json or record the "
                              "verified model-card settings in preprocessing.")
         processor = json.loads(processor_file.read_text(encoding="utf-8"))
         if not isinstance(processor, dict):
@@ -86,6 +102,8 @@ def _is_encoder(module):
     blocks = getattr(module, "blocks", None)
     return (isinstance(projection, nn.Conv2d)
             and _pair(projection.kernel_size) == (14, 14)
+            and _pair(projection.stride) == (14, 14)
+            and projection.in_channels == 3
             and projection.out_channels == 768
             and isinstance(blocks, (nn.ModuleList, nn.Sequential))
             and len(blocks) == 12)
@@ -172,6 +190,8 @@ def _source_provenance(directory, expected_commit=None):
     sources = sorted(directory.rglob("*.py"))
     if not sources:
         raise ValueError(f"No reviewed Python source found in {directory}")
+    if any(not path.resolve().is_relative_to(directory) for path in sources):
+        raise ValueError("RadJEPA source files must stay inside the reviewed local snapshot")
     result = {"source_sha256": {str(path.relative_to(directory)): sha256_file(path) for path in sources}}
     if (directory / ".git").exists():
         commit = subprocess.run(["git", "-C", str(directory), "rev-parse", "HEAD"],
@@ -184,13 +204,15 @@ def _source_provenance(directory, expected_commit=None):
     return result
 
 
-def _hf_weights(directory):
+def _local_model_config(directory):
     config_file = directory / "config.json"
     if not config_file.is_file():
         raise FileNotFoundError(f"Local RadJEPA snapshot needs {config_file}")
     config = json.loads(config_file.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("RadJEPA config.json must be a JSON object")
     auto_map = config.get("auto_map", {})
-    if "AutoModel" not in auto_map:
+    if not isinstance(auto_map, dict) or "AutoModel" not in auto_map:
         raise ValueError("RadJEPA snapshot lacks the authors' custom AutoModel mapping")
     for key in ("AutoConfig", "AutoModel"):
         reference = auto_map.get(key)
@@ -205,21 +227,30 @@ def _hf_weights(directory):
         module_file = directory.joinpath(*parts).with_suffix(".py").resolve()
         if not module_file.is_relative_to(directory) or not module_file.is_file():
             raise FileNotFoundError(f"Local custom-code module for {key} not found: {module_file}")
-    for name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
-        index = directory / name
-        if index.is_file():
-            mapping = json.loads(index.read_text(encoding="utf-8")).get("weight_map", {})
-            names = sorted(set(mapping.values()))
-            if not names:
-                raise ValueError(f"Empty weight map in {index}")
-            break
-    else:
-        names = [name for name in ("model.safetensors", "pytorch_model.bin")
-                 if (directory / name).is_file()]
-        if len(names) > 1:
-            raise ValueError("Snapshot contains two weight formats; keep the verified format to avoid ambiguity")
-    if not names:
+    return config
+
+
+def _hf_weights(directory):
+    _local_model_config(directory)
+    candidates = [name for name in (OFFICIAL_CHECKPOINT_NAME,
+                                   "model.safetensors.index.json", "pytorch_model.bin.index.json",
+                                   "model.safetensors", "pytorch_model.bin")
+                  if (directory / name).is_file()]
+    if len(candidates) > 1:
+        raise ValueError("Snapshot contains multiple weight formats or representations; keep exactly one "
+                         "verified format to avoid ambiguity")
+    if not candidates:
         raise FileNotFoundError("RadJEPA snapshot has no pretrained weights")
+    selected = candidates[0]
+    if selected.endswith(".index.json"):
+        index = directory / selected
+        mapping = json.loads(index.read_text(encoding="utf-8")).get("weight_map", {})
+        if (not isinstance(mapping, dict) or not mapping
+                or not all(isinstance(name, str) and name for name in mapping.values())):
+            raise ValueError(f"Invalid or empty weight map in {index}")
+        names = sorted(set(mapping.values()))
+    else:
+        names = [selected]
     weights = []
     for name in names:
         path = (directory / name).resolve()
@@ -229,33 +260,129 @@ def _hf_weights(directory):
     return weights
 
 
+@contextmanager
+def _local_snapshot_classes(directory, metadata):
+    """Import reviewed files in a private namespace without a Hub/cache lookup."""
+    references = metadata["auto_map"]
+    if "AutoConfig" not in references:
+        raise ValueError("The official RadJEPA tar release requires a local AutoConfig mapping")
+    namespace = "_foundation_radjepa_" + uuid4().hex
+    package = ModuleType(namespace)
+    package.__path__ = [str(directory)]
+    package.__package__ = namespace
+    sys.modules[namespace] = package
+    try:
+        classes = []
+        for key in ("AutoConfig", "AutoModel"):
+            module_name, _, class_name = references[key].rpartition(".")
+            module = importlib.import_module(f"{namespace}.{module_name}")
+            cls = getattr(module, class_name, None)
+            if not isinstance(cls, type):
+                raise ValueError(f"Local RadJEPA {key} reference does not name a class")
+            classes.append(cls)
+        yield tuple(classes)
+    except ImportError as error:
+        raise ImportError("RadJEPA custom code requires its compatible dependencies; the official release "
+                          "recommends timm==1.0.24. Use an isolated environment rather than changing "
+                          "EVA-X's timm==0.4.12.") from error
+    finally:
+        for name in list(sys.modules):
+            if name == namespace or name.startswith(namespace + "."):
+                del sys.modules[name]
+
+
+def _official_encoder_state(checkpoint):
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError("RadJEPA official checkpoint must contain encoder or state_dict.encoder")
+    candidates = []
+    if "encoder" in payload:
+        candidates.append(("encoder", payload["encoder"]))
+    nested = payload.get("state_dict")
+    if isinstance(nested, dict) and "encoder" in nested:
+        candidates.append(("state_dict.encoder", nested["encoder"]))
+    if len(candidates) != 1:
+        raise ValueError("RadJEPA checkpoint must contain exactly one encoder or state_dict.encoder; "
+                         "teacher/predictor weights are never selected implicitly")
+    state_key, state = candidates[0]
+    if (not isinstance(state, dict) or not state or
+            not all(isinstance(key, str) and isinstance(value, torch.Tensor)
+                    for key, value in state.items())):
+        raise ValueError("RadJEPA encoder weights must be a nonempty tensor state dict")
+    normalized = {}
+    for key, value in state.items():
+        name = key
+        while name.startswith(("module.", "encoder.")):
+            name = name.split(".", 1)[1]
+        if not name or name in normalized:
+            raise ValueError(f"Duplicate or empty RadJEPA weight name after removing leading prefixes: {key!r}")
+        normalized[name] = value
+    return normalized, state_key
+
+
+def _load_official_snapshot(checkpoint, weight_file, config, preprocess):
+    metadata = _local_model_config(checkpoint)
+    size = metadata.get("image_size")
+    if (metadata.get("model_type") != "radjepa" or metadata.get("patch_size") != 14
+            or metadata.get("embed_dim") != 768 or isinstance(size, bool)
+            or not isinstance(size, int) or size <= 0 or size % 14):
+        raise ValueError("Official RadJEPA config must describe a three-channel ViT-B/14 with embed_dim=768")
+    if preprocess.image_size != size:
+        raise ValueError(f"RadJEPA preprocessing image_size={preprocess.image_size} differs from the "
+                         f"official fixed positional-embedding image_size={size}")
+    with _local_snapshot_classes(checkpoint, metadata) as (config_class, model_class):
+        # The author's from_pretrained calls hf_hub_download even for local paths
+        # and ignores strict loading-info arguments. Neither factory is called.
+        model = model_class(config_class(**metadata))
+    if not isinstance(model, nn.Module):
+        raise ValueError("Reviewed RadJEPA model class must construct a torch.nn.Module")
+    encoder, path = _select_encoder(model, config.get("encoder_path"))
+    pos_embed = getattr(encoder, "pos_embed", None)
+    if (_prefix_count(encoder) != 0 or not isinstance(pos_embed, torch.Tensor)
+            or tuple(pos_embed.shape) != (1, (size // 14) ** 2, 768)):
+        raise ValueError("Official RadJEPA encoder must expose patch-only fixed positional embeddings")
+    state, state_key = _official_encoder_state(weight_file)
+    try:
+        encoder.load_state_dict(state, strict=True)
+    except RuntimeError as error:
+        raise ValueError(f"RadJEPA pretrained backbone mismatch: {error}") from error
+    return encoder, path, state_key
+
+
 def _load_hf(config, preprocess):
     checkpoint = Path(config["checkpoint"]).expanduser().resolve()
     if not checkpoint.is_dir():
         raise ValueError("RadJEPA hf checkpoint must be a complete local Hugging Face snapshot directory")
     weights = _hf_weights(checkpoint)
     source = _source_provenance(checkpoint, config.get("expected_repo_commit"))
-    try:
-        from transformers import AutoModel
-    except ImportError as error:
-        raise ImportError("RadJEPA hf backend requires transformers and the authors' custom-code dependencies. "
-                          "The official model card recommends timm==1.0.24; use an isolated environment "
-                          "rather than changing EVA-X's timm==0.4.12.") from error
-    loaded = AutoModel.from_pretrained(str(checkpoint), local_files_only=True,
-                                      trust_remote_code=True, output_loading_info=True,
-                                      ignore_mismatched_sizes=False)
-    if not isinstance(loaded, tuple) or len(loaded) != 2:
-        raise ValueError("Custom RadJEPA loader did not return loading information; strict pretrained verification failed")
-    model, info = loaded
-    bad = {key: info.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
-           if info.get(key)}
-    if bad:
-        raise ValueError(f"RadJEPA pretrained loading mismatch: {bad}")
-    encoder, path = _select_encoder(model, config.get("encoder_path"))
+    official = len(weights) == 1 and weights[0].name == OFFICIAL_CHECKPOINT_NAME
+    if official:
+        encoder, path, state_key = _load_official_snapshot(checkpoint, weights[0], config, preprocess)
+    else:
+        try:
+            from transformers import AutoModel
+        except ImportError as error:
+            raise ImportError("RadJEPA hf backend requires transformers and the authors' custom-code dependencies. "
+                              "The official model card recommends timm==1.0.24; use an isolated environment "
+                              "rather than changing EVA-X's timm==0.4.12.") from error
+        loaded = AutoModel.from_pretrained(str(checkpoint), local_files_only=True,
+                                          trust_remote_code=True, output_loading_info=True,
+                                          ignore_mismatched_sizes=False)
+        if not isinstance(loaded, tuple) or len(loaded) != 2:
+            raise ValueError("Custom RadJEPA loader did not return loading information; strict pretrained verification failed")
+        model, info = loaded
+        bad = {key: info.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+               if info.get(key)}
+        if bad:
+            raise ValueError(f"RadJEPA pretrained loading mismatch: {bad}")
+        encoder, path = _select_encoder(model, config.get("encoder_path"))
     provenance = {"model_id": OFFICIAL_MODEL_ID, "repository": OFFICIAL_REPOSITORY,
                   "backend": "hf", "checkpoint": str(checkpoint), "encoder_path": path,
                   "weights_sha256": {file.name: sha256_file(file) for file in weights},
                   "pooling": "mean_patch_tokens", **source}
+    provenance["config_sha256"] = sha256_file(checkpoint / "config.json")
+    if official:
+        provenance.update({"weight_format": "official_encoder_tar", "state_key": state_key})
     processor_file = checkpoint / "preprocessor_config.json"
     if processor_file.is_file():
         provenance["preprocessor_sha256"] = sha256_file(processor_file)
