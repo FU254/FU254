@@ -2,6 +2,7 @@
   "base_config": "common.json",
   "model": "chexfound",
   "repo_dir": "foundation_sources/CheXFound",
-  "checkpoint": "foundation_weights/chexfound/teacher.pth",
+  "checkpoint": "foundation_weights/CheXFound/teacher_checkpoint.pth",
+  "config_file": "foundation_weights/CheXFound/config.yaml",
   "state_key": "teacher"
 }

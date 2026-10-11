@@ -54,16 +54,19 @@ git -C foundation_sources/dinov2 checkout 7764ea0f912e53c92e82eb78a2a1631e92725f
 - 官方仓库：[RPIDIAL/CheXFound](https://github.com/RPIDIAL/CheXFound)，核对版本 `7e288d06532f24abedb7d00781185c36727d9d69`。
 - 官方 README 的 [模型和配置目录](https://drive.google.com/drive/folders/1GX2BWbujuVABtVpSZ4PTBykGULzrw806?usp=sharing) 提供发布文件。
 - ViT-L/16、512 输入、1024 通道、4 个 register token、SwiGLU、24 个 fused QKV 投影。适配器使用编码器，不加载 GLoRI 下游分类头。
-- 默认配置文件 `chexfound/configs/train/vitl16_ibot333_highres512.yaml`，同时读取 `chexfound/configs/ssl_default_config.yaml` 中的架构默认值。若下载的权重配有其他配置，在 JSON 里填写对应 `config_file`。
-- `configs/chexfound.json` 填 `repo_dir` 和 `checkpoint`。默认 `state_key: "teacher"`；实际 teacher 导出若不含这层键，应根据文件结构设置为空值。编码器参数必须完整匹配，FSDP chunk 包装会转换为等价的连续 block 名称。
+- 用户实际下载的官方示例文件为 `teacher_checkpoint.pth`（1,610,888,895 字节）、`config.yaml`（2,740 字节）、`glori.pth` 和 `results_eval_linear.json`。文件清单与配套 YAML 已核对：`vit_large`、patch16、512 输入、4 个 register tokens、`swiglufused` 和 layerscale `1e-5` 与适配器匹配。真实权重张量和服务器计算仍需通过加载检查。GLoRI 文件是作者原有分类头，本项目的新分类任务只加载基础编码器。
+- `configs/chexfound.json` 已按用户实际目录设置 `checkpoint: "foundation_weights/CheXFound/teacher_checkpoint.pth"` 和 `config_file: "foundation_weights/CheXFound/config.yaml"`，同时读取官方源码中 `chexfound/configs/ssl_default_config.yaml` 的默认值。目录大小写按上传后的实际名称填写，Linux 区分大小写。未指定 `config_file` 时，适配器仍可使用源码中 `chexfound/configs/train/vitl16_ibot333_highres512.yaml`。
+- `configs/chexfound.json` 的 `repo_dir` 指向独立的官方源码目录。默认 `state_key: "teacher"`，对应作者示例读取的容器；实际 teacher 导出若不含这层键，应根据文件结构设置为空值。编码器参数必须完整匹配，FSDP chunk 包装会转换为等价的连续 block 名称。
 - 输入按官方 evaluation 规则做 shortest-edge resize / center crop 和 ImageNet 归一化。
 
 ```bash
 python -m pip install -r foundation_sft/requirements-chexfound.txt
-mkdir -p foundation_sources foundation_weights/chexfound
+mkdir -p foundation_sources foundation_weights/CheXFound
 git clone https://github.com/RPIDIAL/CheXFound.git foundation_sources/CheXFound
 git -C foundation_sources/CheXFound checkout 7e288d06532f24abedb7d00781185c36727d9d69
 ```
+
+电脑上的权重位于 `D:\99\EVA-X-main\foundation_weights\CheXFound`。如果服务器不能访问 GitHub，也可在电脑下载 [官方源码 ZIP](https://github.com/RPIDIAL/CheXFound/archive/7e288d06532f24abedb7d00781185c36727d9d69.zip)，把解压后的仓库根目录放到 `D:\99\EVA-X-main\foundation_sources\CheXFound`，确保其中直接存在 `chexfound/models/vision_transformer.py`。通过 PyCharm 分别上传 `foundation_weights` 和 `foundation_sources` 到项目根目录。下载了权重不代表同时下载了这份模型源码。
 
 作者原环境使用 Torch 2.0 和 xformers；你当前 2.0.1 / 0.0.21 需要用 `smoke` 验证这一组合。CPU 检查时若装有 xformers，启动 Python 前设置 `XFORMERS_DISABLED=1`；GPU 检查使用实际安装的加速路径。
 
