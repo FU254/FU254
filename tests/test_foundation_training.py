@@ -6,6 +6,7 @@ quality. Tests never use clinical data, public pretrained weights or a network.
 
 import copy
 from contextlib import redirect_stdout
+import hashlib
 import importlib.util
 import io
 import json
@@ -112,6 +113,35 @@ class FoundationTrainingTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def _run_with_first_epoch_checkpoint(self, config, name):
+        checkpoint = self.root / name
+        original_save = trainer._torch_save
+
+        def capture_first_epoch(path, payload):
+            original_save(path, payload)
+            if Path(path).name == "last.pt" and payload["epoch"] == 0:
+                shutil.copy2(path, checkpoint)
+
+        with redirect_stdout(io.StringIO()), patch.object(
+                trainer, "_torch_save", side_effect=capture_first_epoch):
+            run = trainer.run_training(config)
+        self.assertTrue(checkpoint.is_file())
+        return run, checkpoint
+
+    def _assert_state_equal(self, expected, actual):
+        if isinstance(expected, torch.Tensor):
+            torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+        elif isinstance(expected, dict):
+            self.assertEqual(set(expected), set(actual))
+            for key in expected:
+                self._assert_state_equal(expected[key], actual[key])
+        elif isinstance(expected, (list, tuple)):
+            self.assertEqual(len(expected), len(actual))
+            for first, second in zip(expected, actual):
+                self._assert_state_equal(first, second)
+        else:
+            self.assertEqual(expected, actual)
+
     def test_linear_probe_and_lora_train_save_reload_and_evaluate(self):
         for mode in ("linear_probe", "lora"):
             with self.subTest(mode=mode):
@@ -212,6 +242,114 @@ class FoundationTrainingTests(unittest.TestCase):
         )
         self.assertEqual(json.loads((uninterrupted / "selection.json").read_text()),
                          json.loads((resumed / "selection.json").read_text()))
+
+    def test_amp_change_on_ordinary_resume_is_rejected(self):
+        source = _merge(self.config, {"mode": "lora", "training": {"amp": True}})
+        _, checkpoint = self._run_with_first_epoch_checkpoint(source, "amp_source.pt")
+        full_precision = _merge(source, {"training": {"amp": False}})
+        previous_bytes = checkpoint.read_bytes()
+        with redirect_stdout(io.StringIO()), patch.object(
+                trainer, "_train_epoch", wraps=trainer._train_epoch) as epoch:
+            with self.assertRaises(ValueError):
+                trainer.run_training(full_precision, resume=checkpoint)
+        self.assertEqual(epoch.call_count, 0)
+        self.assertEqual(checkpoint.read_bytes(), previous_bytes)
+
+    def test_explicit_full_precision_resume_preserves_continuity_and_provenance(self):
+        # CPU execution is FP32 for both flags. This makes any unintended loss
+        # of optimizer, scheduler, best-model, augmentation or RNG state visible
+        # as an exact difference after the explicit precision transition.
+        config = _merge(self.config, {"mode": "lora", "training": {"amp": True}})
+        uninterrupted, checkpoint = self._run_with_first_epoch_checkpoint(
+            config, "amp_epoch_zero.pt")
+        unchanged = copy.deepcopy(config)
+        checkpoint_bytes = checkpoint.read_bytes()
+        source = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        with redirect_stdout(io.StringIO()):
+            resumed = trainer.run_training(
+                config, resume=checkpoint, resume_full_precision=True)
+        self.assertEqual(config, unchanged)
+        self.assertEqual(checkpoint.read_bytes(), checkpoint_bytes)
+        full_last = torch.load(uninterrupted / "last.pt", map_location="cpu", weights_only=True)
+        resumed_last = torch.load(resumed / "last.pt", map_location="cpu", weights_only=True)
+        self.assertFalse(resumed_last["config"]["training"]["amp"])
+        for field in ("model", "best_model", "optimizer", "scheduler", "rng", "history",
+                      "epoch", "best_auc", "bad_epochs", "cohort_hash", "model_metadata"):
+            self._assert_state_equal(full_last[field], resumed_last[field])
+        self.assertEqual(resumed_last["history"][:len(source["history"])], source["history"])
+        self.assertEqual([row["epoch"] for row in resumed_last["history"]], [1, 2])
+        self.assertEqual(json.loads((resumed / "config.json").read_text())["training"]["amp"], False)
+        pd.testing.assert_frame_equal(
+            pd.read_csv(uninterrupted / "test" / "predictions.csv"),
+            pd.read_csv(resumed / "test" / "predictions.csv"), check_exact=True,
+        )
+        self.assertEqual(json.loads((uninterrupted / "selection.json").read_text()),
+                         json.loads((resumed / "selection.json").read_text()))
+        provenance = json.loads((resumed / "resume.json").read_text())
+        self.assertEqual(provenance["checkpoint_sha256"],
+                         hashlib.sha256(checkpoint_bytes).hexdigest())
+        self.assertEqual(provenance["checkpoint"], str(checkpoint.resolve()))
+        self.assertEqual(provenance["epochs_completed_before_resume"], 1)
+        self.assertEqual(provenance["next_epoch"], 2)
+        self.assertTrue(provenance["source_amp"])
+        self.assertFalse(provenance["target_amp"])
+        self.assertTrue(provenance["precision_changed"])
+        self.assertTrue(provenance["history_before_resume_uses_source_precision"])
+
+    def test_full_precision_resume_does_not_allow_other_training_or_seed_changes(self):
+        source = _merge(self.config, {"mode": "lora", "training": {"amp": True}})
+        _, checkpoint = self._run_with_first_epoch_checkpoint(source, "strict_amp_source.pt")
+        changes = (
+            {"training": {"head_lr": 0.03}},
+            {"training": {"batch_size": 2}},
+            {"training": {"accumulation_steps": 2}},
+            {"training": {"epochs": 3}},
+            {"seed": source["seed"] + 1},
+        )
+        for change in changes:
+            with self.subTest(change=change), redirect_stdout(io.StringIO()), patch.object(
+                    trainer, "_train_epoch", wraps=trainer._train_epoch) as epoch:
+                altered = _merge(source, change)
+                unchanged = copy.deepcopy(altered)
+                with self.assertRaises(ValueError):
+                    trainer.run_training(altered, resume=checkpoint, resume_full_precision=True)
+                self.assertEqual(epoch.call_count, 0)
+                self.assertEqual(altered, unchanged)
+
+    def test_full_precision_resume_requires_checkpoint_and_amp_source(self):
+        config = _merge(self.config, {"mode": "lora"})
+        with redirect_stdout(io.StringIO()), patch.object(
+                trainer, "_train_epoch", wraps=trainer._train_epoch) as epoch:
+            with self.assertRaises(ValueError):
+                trainer.run_training(config, resume_full_precision=True)
+            self.assertEqual(epoch.call_count, 0)
+        _, checkpoint = self._run_with_first_epoch_checkpoint(config, "fp32_source.pt")
+        previous_bytes = checkpoint.read_bytes()
+        with redirect_stdout(io.StringIO()), patch.object(
+                trainer, "_train_epoch", wraps=trainer._train_epoch) as epoch:
+            with self.assertRaises(ValueError):
+                trainer.run_training(config, resume=checkpoint, resume_full_precision=True)
+            self.assertEqual(epoch.call_count, 0)
+        self.assertEqual(checkpoint.read_bytes(), previous_bytes)
+
+    def test_full_precision_resume_rejects_nonfinite_checkpoint_parameters(self):
+        config = _merge(self.config, {"mode": "lora", "training": {"amp": True}})
+        _, checkpoint = self._run_with_first_epoch_checkpoint(config, "finite_amp_source.pt")
+        original_bytes = checkpoint.read_bytes()
+        for value in (float("nan"), float("inf")):
+            with self.subTest(value=value):
+                damaged = torch.load(checkpoint, map_location="cpu", weights_only=True)
+                name = sorted(damaged["model"])[0]
+                damaged["model"][name].reshape(-1)[0] = value
+                damaged_path = self.root / "invalid_amp_source.pt"
+                torch.save(damaged, damaged_path)
+                with redirect_stdout(io.StringIO()), patch.object(
+                        trainer, "_train_epoch", wraps=trainer._train_epoch) as epoch:
+                    with self.assertRaisesRegex(ValueError, "(?i)non.?finite"):
+                        trainer.run_training(
+                            config, resume=damaged_path, resume_full_precision=True)
+                    self.assertEqual(epoch.call_count, 0)
+        self.assertEqual(checkpoint.read_bytes(), original_bytes)
 
 
 class GradientAccumulationTests(unittest.TestCase):

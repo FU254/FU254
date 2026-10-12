@@ -236,6 +236,51 @@ python -m foundation_sft.train --config foundation_sft/configs/cxformer.json --d
 
 原 `smoke` 验证的是 FP32 的前后向、冻结参数及保存重载，没有覆盖完整训练的 AMP 和梯度累计路径。五模型的 smoke 全部通过后，仍应查看正式训练日志确认 epoch 正常完成。不要通过关闭非有限梯度检查来继续训练。修复的半精度数值回归测试使用合成样本和真实 CPU GradScaler；医学权重的 CUDA 训练需在服务器验证。
 
+### 单项训练的非有限 loss 与 FP32 恢复
+
+`Non-finite training loss` 表示前向计算的 loss 已出现 NaN/Inf，降低 GradScaler 的反向缩放不能修复这种前向错误。若上一轮 FP32 验证正常，而 AMP 训练失败，应检查输入和检查点；半精度前向溢出是可能原因，不能仅凭日志断言。原严格检查仍保留，恢复后遇到非有限 loss 或梯度也会停止。
+
+允许用 `--resume-full-precision` 明确将 **AMP 检查点转为 FP32 继续训练**。它只允许 `amp: true → false`，其他训练设置、种子、预训练权重及分组校验保持有效。优化器、调度器、随机状态、已完成轮数、历史和原最佳模型保留；原 AMP scaler 停用。新运行保存独立的 `config.json` 和 `resume.json`，记录源检查点 SHA256、精度变更和接续轮数。精度变更前的历史仍属于原 AMP 训练，这不是从第一轮开始的纯 FP32 实验。无需覆盖或改写原检查点。
+
+如果是套件中只有一项失败，可在项目根目录执行：
+
+```bash
+python -m foundation_sft.recover_experiment \
+  --suite runs/foundation_sft/suites/实际套件目录 \
+  --job cxformer_lora_seed42 --resume-full-precision
+```
+
+查看已经完成的各模型患者指标和当前任务状态，使用只读入口（套件仍在运行时也可查看）：
+
+```bash
+python -m foundation_sft.recover_experiment \
+  --suite runs/foundation_sft/suites/实际套件目录 --show-metrics
+```
+
+输出最佳验证 ROC-AUC、患者测试 ROC-AUC 及其 95% CI、梯形 PR-AUC、AP、敏感度和特异度。验证指标和测试指标分别注明；仅指定种子 42 时，患者 bootstrap CI 不代表跨种子训练波动。
+
+辅助入口从失败任务日志定位准确的 `last.pt`，进入原 Conda 环境恢复，实时显示训练日志，保存独立恢复目录和成功回执，不修改原 `suite.json`。它拒绝恢复非失败任务和同 GPU 仍有训练任务的情形；同一失败项并发恢复由独立锁阻止。确认所用 GPU 的可用显存足以运行 FP32。
+
+等原套件的其他任务结束，再使用恢复命令打印的准确恢复目录：
+
+```bash
+python -m foundation_sft.recover_experiment \
+  --suite runs/foundation_sft/suites/实际套件目录 \
+  --job cxformer_lora_seed42 --report-only \
+  --recovery-dir runs/foundation_sft/suites/实际套件目录/实际恢复目录
+```
+
+报告仅使用原套件的其他完成项与明确指定的恢复项。原失败记录和原部分报告保留，新报告输出到独立目录；完整样本/标签来源/分组指纹需一致，且原计划的每项模型、模式、种子都必须有一个成功结果。恢复记录不应通过比较测试成绩挑选。
+
+也可直接调用训练入口：
+
+```bash
+python -m foundation_sft.train --config 原配置快照.json \
+  --action train --resume 失败运行目录/last.pt --resume-full-precision
+```
+
+普通 `--resume` 仍要求训练设置完全一致。FP32 恢复后若再次正常中断，应使用新运行的 `config.json` 和 `last.pt` 做普通 `--resume`。
+
 ## 修复服务器第一次统一检查的错误
 
 用户的第一次五模型检查已完成数据准备并通过 CheXFound，另外四项失败。实际日志分别是 EVA-X 的 NumPy 标量元数据不被 Torch `weights_only` 支持，RAD-DINO/CXformer 的 Transformers 4.50.3 访问 Torch 2.0.1 不存在的 `torch.compiler`，以及尚未创建 `radjepa_sft`。这些是三项不同的问题。

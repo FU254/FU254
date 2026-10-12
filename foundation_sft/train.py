@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import nullcontext
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import math
@@ -23,7 +24,7 @@ from .data import CXRDataset, build_cohort
 from .metrics import (aggregate_patient_predictions, binary_metrics,
                       save_evaluation, select_threshold)
 from .models import build_adapter
-from .models.common import FoundationClassifier
+from .models.common import FoundationClassifier, sha256_file
 from .split import load_or_create_split
 
 
@@ -256,7 +257,12 @@ def _new_run(config, suffix=""):
     return path
 
 
-def run_training(config, adapter=None, resume=None):
+def run_training(config, adapter=None, resume=None, *, resume_full_precision=False):
+    if resume_full_precision and not resume:
+        raise ValueError("--resume-full-precision requires --resume with an AMP-enabled last.pt")
+    if resume_full_precision:
+        config = deepcopy(config)
+        config["training"]["amp"] = False
     set_seed(config["seed"])
     split = prepare(config)
     cohort_hash = _split_hash(split)
@@ -281,19 +287,45 @@ def run_training(config, adapter=None, resume=None):
     criterion = FocalLoss(train["focal_gamma"], train["focal_scale"])
     start_epoch, best_auc, bad_epochs, best_model = 0, -math.inf, 0, None
     history = []
+    resume_provenance = None
     if resume:
         previous = _load_checkpoint(resume, model, config, cohort_hash)
-        if previous["config"]["training"] != train or previous["config"]["seed"] != config["seed"]:
+        expected_training = deepcopy(previous["config"]["training"])
+        if resume_full_precision:
+            if expected_training.get("amp") is not True:
+                raise ValueError("--resume-full-precision requires an AMP-enabled checkpoint; "
+                                 "use ordinary --resume for an FP32 checkpoint")
+            expected_training["amp"] = False
+            if any(not torch.isfinite(parameter).all().item()
+                   for parameter in model.parameters() if parameter.requires_grad):
+                raise ValueError("Cannot recover non-finite checkpoint parameters by changing precision")
+        if expected_training != train or previous["config"]["seed"] != config["seed"]:
             raise ValueError("Resume requires the same training settings and seed")
         optimizer.load_state_dict(previous["optimizer"])
         scheduler.load_state_dict(previous["scheduler"])
-        scaler.load_state_dict(previous["scaler"])
+        if not resume_full_precision:
+            scaler.load_state_dict(previous["scaler"])
         start_epoch = previous["epoch"] + 1
         best_auc, bad_epochs = previous["best_auc"], previous["bad_epochs"]
         best_model, history = previous["best_model"], previous["history"]
         _restore_rng(previous["rng"], generator)
+        resume_provenance = {
+            "checkpoint": str(Path(resume).expanduser().resolve()),
+            "checkpoint_sha256": sha256_file(resume),
+            "epochs_completed_before_resume": start_epoch,
+            "next_epoch": start_epoch + 1,
+            "source_amp": previous["config"]["training"]["amp"],
+            "target_amp": train["amp"],
+            "precision_changed": bool(resume_full_precision),
+            "history_before_resume_uses_source_precision": True,
+        }
     run = _new_run(config)
     _json(run / "config.json", config)
+    if resume_provenance is not None:
+        _json(run / "resume.json", resume_provenance)
+        if resume_full_precision:
+            print(f"[resume] Continuing after {start_epoch} completed epochs in FP32; "
+                  "optimizer, scheduler, RNG and prior best/history are retained.", flush=True)
     _json(run / "model_metadata.json", model.training_metadata())
     _json(run / "environment.json", {"torch": str(torch.__version__), "cuda_build": torch.version.cuda,
                                      "device": str(device), "cohort_hash": cohort_hash,
@@ -454,12 +486,16 @@ def main(argv=None):
     parser.add_argument("--seed", type=int)
     parser.add_argument("--checkpoint", help="Trained best.pt for evaluation")
     parser.add_argument("--resume", help="last.pt to resume with identical training settings")
+    parser.add_argument("--resume-full-precision", action="store_true",
+                        help="Explicitly resume an AMP checkpoint in FP32; all other settings stay fixed")
     parser.add_argument("--result-json", help="Write a machine-readable success receipt for workflow automation")
     parser.add_argument("--audit-output", help="Fresh directory for a full frozen-split pixel audit")
     parser.add_argument("--cache-dir", help="Optional private cache for matching, audits and resized images")
     parser.add_argument("--force-audit", action="store_true", default=None,
                         help="Decode every image again even when a successful audit is cached")
     args = parser.parse_args(argv)
+    if args.resume_full_precision and (args.action != "train" or not args.resume):
+        parser.error("--resume-full-precision requires --action train and --resume")
     config = load_config(args.config, {"device": args.device, "mode": args.mode, "seed": args.seed,
                                      "cache_dir": args.cache_dir, "force_audit": args.force_audit})
     if args.action == "prepare":
@@ -486,7 +522,8 @@ def main(argv=None):
         result = evaluate(config, args.checkpoint)
         receipt = {"run_dir": str(result.resolve())}
     else:
-        result = run_training(config, resume=args.resume)
+        result = run_training(config, resume=args.resume,
+                              resume_full_precision=args.resume_full_precision)
         receipt = {"run_dir": str(result.resolve())}
     if args.result_json:
         _json(args.result_json, {"action": args.action, "model": config["model"],
