@@ -119,7 +119,7 @@ python -m foundation_sft.train --config foundation_sft/configs/radjepa_imagenet.
 
 ## 共同的检查顺序
 
-每个模型填好路径后先运行 `--action smoke`，再启动监督训练。没有医学权重的云端测试只验证代码和架构，不验证医学任务表现。目前也没有连接你的 SSH 服务器，五个新模型均未完成实际服务器权重加载与 GPU 训练验证。
+每个模型填好路径后先运行 `--action smoke`，再启动监督训练。没有医学权重的云端测试只验证代码和架构，不验证医学任务表现。用户已在服务器上报告 CheXFound 的真实 teacher 权重加载、512 输入、24 层 LoRA、GPU 前向/反向及保存重载检查通过。助手仍没有连接该 SSH 服务器；EVA-X 的新框架、RAD-DINO、CXformer、RadJEPA 和 RayDINO 尚未收到对应的服务器检查通过结果。
 
 HF 依赖固定为 Transformers 4.50.3、huggingface-hub 0.29.3、tokenizers 0.21.1 和 safetensors 0.4.5，以保留对现有 Torch 2.0 的接口支持；云端实际验证使用 Torch 2.9.1 CPU，服务器兼容性仍需实际检查。
 

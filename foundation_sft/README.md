@@ -54,6 +54,33 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --mode
 
 你仍然可以在 PyCharm 中修改代码。Git 用于同步和保存版本；数据和预训练权重继续留在服务器上。
 
+## 五个可直接运行的训练入口
+
+仓库根目录新增五个入口，均调用 `foundation_sft.train.main`，自动以项目根目录作为工作目录。可在 PyCharm 中直接运行这些根目录脚本；五个文件和整个 `foundation_sft` 一起上传到 `/home/cfu/EVA-X-main`。同步时保留自己的 `common.json` 数据路径配置，模型源码和已下载权重继续使用现有目录。
+
+| 模型 | 根目录脚本 | 默认 GPU | Python 环境 |
+|---|---|---|---|
+| EVA-X Base | `train_eva_x.py` | `cuda:0` | `evax_lora` |
+| RAD-DINO | `train_rad_dino.py` | `cuda:1` | `evax_lora` |
+| CXformer Base | `train_cxformer.py` | `cuda:2` | `evax_lora` |
+| CheXFound | `train_chexfound.py` | `cuda:3` | `evax_lora` |
+| RadJEPA | `train_radjepa.py` | `cuda:4` | `radjepa_sft` |
+
+入口默认训练 LoRA。先为尚未验证的模型执行 `--action smoke`，通过后再正式训练；服务器目前已收到 CheXFound 的真实权重/GPU 检查通过结果，其余四个仍需各自验证。PyCharm 解释器和空 `LD_LIBRARY_PATH` 的设置同上。GPU 编号可用 `--device` 覆盖，启动前用 `nvidia-smi` 查看可用卡；示例编号不代表服务器当前空闲状态。
+
+```bash
+# 在对应环境中运行，可分别在独立终端选择不同模型。
+python train_chexfound.py --action smoke
+python train_chexfound.py
+python train_chexfound.py --mode linear_probe
+
+# 后置参数覆盖入口默认值，也可检查 CLI 用法。
+python train_eva_x.py --device cuda:3 --action smoke
+python train_radjepa.py --help
+```
+
+RadJEPA 入口选用 `radjepa_imagenet.json` 中明确记录的研究预处理，不宣称已核实为作者预训练规范；环境准备和官方规范获取方法见 [MODEL_SOURCES.md](MODEL_SOURCES.md)。RayDINO 尚未确认取得权重，仍可通过统一入口和 `configs/ray_dino.json` 使用，未纳入这五个便捷入口。
+
 ## 其他五个模型
 
 权重和依赖准备方法见 [MODEL_SOURCES.md](MODEL_SOURCES.md)。目前你已有 EVA-X Base，已在 Windows 电脑下载 RAD-DINO、CXformer Base、RadJEPA 的官方完整目录；还需要上传服务器并逐个验证。准备完成后，替换命令中的配置文件即可：
