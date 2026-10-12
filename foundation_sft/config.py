@@ -11,6 +11,7 @@ DEFAULTS = {
     "output_root": "runs/foundation_sft",
     "split_manifest": "runs/foundation_sft/shared_patient_split.csv",
     "split_seed": 42, "split_ratios": [0.7, 0.1, 0.2],
+    "cache_dir": None, "force_audit": False,
     "data": {
         "excel_path": "/home/cfu/肺功能万能表最终版1_fev1fvc差值标签(1).xlsx",
         "dicom_dir": "/data/users/cfu/DR数据_按文件10份-筛选合成",
@@ -65,6 +66,11 @@ def load_config(path, overrides=None):
         raise ValueError(f"Config must specify a model from {SUPPORTED_MODELS}")
     if config["mode"] not in {"linear_probe", "lora"}:
         raise ValueError("mode must be linear_probe or lora")
+    if config["cache_dir"] is not None and (not isinstance(config["cache_dir"], str)
+                                          or not config["cache_dir"].strip()):
+        raise ValueError("cache_dir must be a nonempty path string or null")
+    if type(config["force_audit"]) is not bool:
+        raise ValueError("force_audit must be a boolean")
     for name in ("epochs", "patience", "batch_size", "accumulation_steps", "lora_rank"):
         value = config["training"][name]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:

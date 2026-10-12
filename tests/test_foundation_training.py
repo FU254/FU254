@@ -164,6 +164,26 @@ class FoundationTrainingTests(unittest.TestCase):
                 for filename in ("roc_curve.png", "precision_recall_curve.png", "calibration_curve.png"):
                     self.assertGreater((evaluated / filename).stat().st_size, 1000)
 
+    def test_cached_data_matches_uncached_training_exactly(self):
+        for mode in ("linear_probe", "lora"):
+            with self.subTest(mode=mode):
+                config = _merge(self.config, {"mode": mode})
+                cached = _merge(config, {"cache_dir": str(self.root / "data_cache")})
+                with redirect_stdout(io.StringIO()):
+                    direct_run = trainer.run_training(config)
+                    cached_run = trainer.run_training(cached)
+                direct = torch.load(direct_run / "last.pt", map_location="cpu", weights_only=True)
+                restored = torch.load(cached_run / "last.pt", map_location="cpu", weights_only=True)
+                self.assertEqual(direct["history"], restored["history"])
+                self.assertEqual(direct["cohort_hash"], restored["cohort_hash"])
+                for name, parameter in direct["model"].items():
+                    torch.testing.assert_close(parameter, restored["model"][name], rtol=0, atol=0)
+                pd.testing.assert_frame_equal(
+                    pd.read_csv(direct_run / "test" / "predictions.csv"),
+                    pd.read_csv(cached_run / "test" / "predictions.csv"), check_exact=True,
+                )
+        self.assertEqual(len(list((self.root / "data_cache" / "pixels").glob("*.npy"))), 22)
+
     def test_epoch_checkpoint_resume_matches_uninterrupted_training_exactly(self):
         config = _merge(self.config, {"mode": "lora"})
         epoch_zero = self.root / "epoch_zero.pt"

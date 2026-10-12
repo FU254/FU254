@@ -86,6 +86,14 @@ def _patient_identity(row, dicom, settings):
 
 
 def build_cohort(config):
+    cache_dir = config.get("cache_dir")
+    if cache_dir:
+        from .cohort_cache import cached_cohort
+        return cached_cohort(config, cache_dir, _build_cohort_uncached)
+    return _build_cohort_uncached(config)
+
+
+def _build_cohort_uncached(config):
     """Match strict workbook labels to DICOM headers without loading a pixel cache.
 
     Only configured Excel patient IDs or DICOM PatientID identify patients by
@@ -363,12 +371,17 @@ class CXRDataset(Dataset):
     """Return images and identities from one frozen cohort, without eager arrays."""
 
     def __init__(self, cohort, preprocess, training=False, seed=42,
-                 horizontal_flip_probability=0.0, horizontal_flip_p=None, rotation_degrees=0.0):
+                 horizontal_flip_probability=0.0, horizontal_flip_p=None, rotation_degrees=0.0,
+                 cache_dir=None):
         required = {"sample_id", "patient_id", "path", "label"}
         if required.difference(cohort.columns):
             raise ValueError("Dataset cohort is missing required columns.")
         self.cohort = cohort.reset_index(drop=True).copy()
         self.preprocess = preprocess
+        self.pixel_cache = None
+        if cache_dir:
+            from .pixel_cache import PixelCache
+            self.pixel_cache = PixelCache(cache_dir)
         self.training = bool(training)
         self.seed = int(seed)
         self.horizontal_flip_probability = float(
@@ -391,14 +404,27 @@ class CXRDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.cohort.iloc[index]
-        try:
-            pixels = _dicom_pixels(pydicom.dcmread(row["path"]))
-        except _DicomDataError as error:
-            raise RuntimeError(f"{error} Cohort row {index}.") from None
-        except Exception:
-            # Exceptions from decoders can include filenames or header values.
-            raise RuntimeError(f"DICOM pixel decoding failed for cohort row {index}.") from None
-        image = _resize_image(pixels, self.preprocess)
+
+        def decode():
+            try:
+                pixels = _dicom_pixels(pydicom.dcmread(row["path"]))
+            except _DicomDataError as error:
+                raise RuntimeError(f"{error} Cohort row {index}.") from None
+            except Exception:
+                # Exceptions from decoders can include filenames or header values.
+                raise RuntimeError(f"DICOM pixel decoding failed for cohort row {index}.") from None
+            return _resize_image(pixels, self.preprocess)
+
+        if self.pixel_cache is None:
+            image = decode()
+        else:
+            from .pixel_cache import PixelCacheError
+            try:
+                image = self.pixel_cache.get(row["path"], self.preprocess, decode,
+                                             expected_size=row.get("dicom_size"),
+                                             expected_mtime_ns=row.get("dicom_mtime_ns"))
+            except PixelCacheError:
+                raise RuntimeError(f"Image cache or source changed for cohort row {index}.") from None
         if self.training and self.rotation_degrees > 0:
             angle = float(torch.rand(())) * (2 * self.rotation_degrees) - self.rotation_degrees
             image = np.asarray(

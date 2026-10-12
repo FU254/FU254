@@ -155,7 +155,21 @@ so replacing only known fields or filenames would not be a sufficient guard.
     return kind, "pixel_decode_failed", "Pixel decoding failed; inspect the original file locally.", []
 
 
-def audit_split(split, output_dir):
+def audit_split(split, output_dir, cache_dir=None, force=False):
+    """Audit every image, optionally reusing an unchanged successful audit.
+
+    The cache is opt-in. It records a successful audit only after confirming
+    that every selected source file remained unchanged during the audit. A hit
+    still creates fresh reports in ``output_dir`` for this experiment.
+    ``force=True`` decodes all images even when a reusable entry exists.
+    """
+    if cache_dir is None:
+        return _audit_split_uncached(split, output_dir)
+    from .audit_cache import cached_audit
+    return cached_audit(split, output_dir, cache_dir, force, _audit_split_uncached)
+
+
+def _audit_split_uncached(split, output_dir):
     """Audit all train/val/test pixel data and return a safe technical report.
 
 ``row`` is the zero-based index within each partition, matching ``CXRDataset``.
@@ -238,6 +252,7 @@ contains paths for local diagnosis; callers should not upload that file.
 
     report = {
         "audit_passed": not failures,
+        "audit_cached": False,
         "checked_images": checked,
         "passed_images": checked - len(failures),
         "failed_images": len(failures),

@@ -91,6 +91,8 @@ def prepare(config):
     split = load_or_create_split(cohort, config["split_manifest"],
                                  seed=config["split_seed"], ratios=config["split_ratios"])
     diagnostics = dict(cohort.attrs.get("cohort_diagnostics", {}))
+    if cohort.attrs.get("cohort_cache_hit"):
+        print("[prepare] Reused cached workbook/DICOM header matching.", flush=True)
     diagnostics["splits"] = {
         name: {"images": int((split["split"] == name).sum()),
                "patients": int(split.loc[split["split"] == name, "patient_id"].nunique()),
@@ -112,7 +114,7 @@ def _loader(split, name, adapter, config, generator=None):
     dataset = CXRDataset(split.loc[split["split"] == name], adapter.preprocess,
                          training=name == "train", seed=config["seed"],
                          horizontal_flip_probability=train["horizontal_flip_probability"],
-                         rotation_degrees=train["rotation_degrees"])
+                         rotation_degrees=train["rotation_degrees"], cache_dir=config.get("cache_dir"))
     return DataLoader(dataset, batch_size=train["batch_size"], shuffle=name == "train",
                       num_workers=train["num_workers"], drop_last=False,
                       pin_memory=str(config["device"]).startswith("cuda"),
@@ -139,6 +141,9 @@ def _train_epoch(model, loader, optimizer, criterion, device, train, scaler):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     total_loss, total_images, window_images = 0.0, 0, 0
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    optimizer_steps, overflow_windows, consecutive_overflows = 0, 0, 0
+    window_denominator = None
     amp = bool(train["amp"] and device.type == "cuda")
     for index, batch in enumerate(loader):
         images = batch["image"].to(device, non_blocking=True)
@@ -149,24 +154,55 @@ def _train_epoch(model, loader, optimizer, criterion, device, train, scaler):
         if not torch.isfinite(loss).item():
             raise RuntimeError("Non-finite training loss")
         count = len(labels)
-        # Sum sample losses before accumulation, then normalize once by the
-        # actual window size: the final short batch/window has the right weight.
-        scaler.scale(loss * count).backward()
+        if window_images == 0:
+            window_denominator = count * train["accumulation_steps"]
+        # Normalize before loss scaling so half-precision backward does not
+        # carry the summed window loss. Keep one denominator for this window;
+        # correct short/unequal batches once its actual sample count is known.
+        scaler.scale(loss * (count / window_denominator)).backward()
         window_images += count
         total_images += count
         total_loss += loss.detach().item() * count
         end_window = (index + 1) % train["accumulation_steps"] == 0 or index + 1 == len(loader)
         if end_window:
             scaler.unscale_(optimizer)
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.div_(window_images)
-            nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
-                                    train["gradient_clip"], error_if_nonfinite=True)
+            gradients = [p.grad for p in parameters if p.grad is not None]
+            if not gradients:
+                raise RuntimeError("No trainable gradients in this accumulation window")
+            finite_gradients = torch.stack([torch.isfinite(g).all() for g in gradients]).all().item()
+            if not finite_gradients and not scaler.is_enabled():
+                raise RuntimeError("Non-finite training gradients with AMP disabled")
+            if finite_gradients:
+                for gradient in gradients:
+                    gradient.mul_(window_denominator / window_images)
+                # A non-finite total norm with finite gradient entries remains
+                # an error; this also guards overflow from normalization after
+                # GradScaler has already recorded the unscaled gradients.
+                nn.utils.clip_grad_norm_(parameters, train["gradient_clip"], error_if_nonfinite=True)
+            old_scale = scaler.get_scale() if not finite_gradients else None
+            # unscale_ records overflowing gradients. GradScaler must see them
+            # before clipping: it skips the update and lowers the loss scale.
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             window_images = 0
+            if finite_gradients:
+                optimizer_steps += 1
+                consecutive_overflows = 0
+            else:
+                overflow_windows += 1
+                consecutive_overflows += 1
+                new_scale = scaler.get_scale()
+                if not new_scale < old_scale:
+                    raise RuntimeError("AMP did not back off after non-finite training gradients")
+                print(f"[amp] Skipped overflowing accumulation window {overflow_windows}; "
+                      f"loss_scale={old_scale:g}->{new_scale:g}", flush=True)
+                if consecutive_overflows >= 16:
+                    raise RuntimeError("AMP gradients overflowed for 16 consecutive accumulation windows. "
+                                       "Check full-precision training before continuing.")
+    if optimizer_steps == 0:
+        raise RuntimeError("No optimizer updates completed in this epoch. "
+                           "Check full-precision training before continuing.")
     return total_loss / total_images
 
 
@@ -420,8 +456,12 @@ def main(argv=None):
     parser.add_argument("--resume", help="last.pt to resume with identical training settings")
     parser.add_argument("--result-json", help="Write a machine-readable success receipt for workflow automation")
     parser.add_argument("--audit-output", help="Fresh directory for a full frozen-split pixel audit")
+    parser.add_argument("--cache-dir", help="Optional private cache for matching, audits and resized images")
+    parser.add_argument("--force-audit", action="store_true", default=None,
+                        help="Decode every image again even when a successful audit is cached")
     args = parser.parse_args(argv)
-    config = load_config(args.config, {"device": args.device, "mode": args.mode, "seed": args.seed})
+    config = load_config(args.config, {"device": args.device, "mode": args.mode, "seed": args.seed,
+                                     "cache_dir": args.cache_dir, "force_audit": args.force_audit})
     if args.action == "prepare":
         result = prepare(config)
         receipt = {"cohort_hash": _split_hash(result)}
@@ -430,10 +470,11 @@ def main(argv=None):
         split = prepare(config)
         output = (Path(args.audit_output).expanduser().resolve() if args.audit_output
                   else _new_run(config, "_data_audit") / "audit")
-        result = audit_split(split, output)
+        result = audit_split(split, output, cache_dir=config.get("cache_dir"),
+                             force=config.get("force_audit", False))
         receipt = {"cohort_hash": _split_hash(split), "audit_passed": result["audit_passed"],
                    "checked_images": result["checked_images"], "failed_images": result["failed_images"],
-                   "audit_output": str(output)}
+                   "audit_output": str(output), "audit_cached": result.get("audit_cached", False)}
         print(json.dumps({**receipt, "example_failures": result["failures"][:3]},
                          ensure_ascii=False, indent=2), flush=True)
     elif args.action == "smoke":
