@@ -126,8 +126,8 @@ def _parallel_by_device(jobs, operation, max_parallel):
 def run_suite(plan, *, check_only=False, max_parallel=5):
     """Run every prespecified job, returning a manifest even for failed stages.
 
-    Success receipts identify each exact run. A smoke failure blocks all formal
-    training. Training failures are reported alongside all successful jobs;
+    Success receipts identify each exact run. Data audit or smoke failures block
+    all formal training. Training failures are reported alongside successful jobs;
     they never cause a different seed to be chosen by its test performance.
     """
     _validate_plan(plan)
@@ -136,7 +136,7 @@ def run_suite(plan, *, check_only=False, max_parallel=5):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     suite = Path(plan["suite_root"]).resolve() / f"suite_{stamp}_{uuid.uuid4().hex[:8]}"
     suite.mkdir(parents=True, exist_ok=False)
-    for name in ("configs", "logs", "receipts"):
+    for name in ("configs", "logs", "receipts", "data_audit"):
         (suite / name).mkdir()
     manifest = {"format_version": 1, "status": "preparing", "check_only": check_only,
                 "project_dir": str(Path.cwd()), "jobs": [], "report_status": "pending"}
@@ -161,12 +161,23 @@ def run_suite(plan, *, check_only=False, max_parallel=5):
             job.update(values)
             save()
 
+    def block_pending(reason):
+        for job in manifest["jobs"]:
+            if job["status"] == "pending":
+                job.update(status="blocked", error=reason)
+        manifest["status"] = "failed"
+        save()
+
     def stage(job, action):
         log = suite / "logs" / f"{job['id']}_{action}.log"
         receipt = suite / "receipts" / f"{job['id']}_{action}.json"
         command = [plan["conda_executable"], "run", "--no-capture-output", "-n", job["env"],
                    "python", "-m", "foundation_sft.train", "--config", job["config_file"],
                    "--action", action, "--result-json", str(receipt)]
+        if action == "audit-data":
+            audit_output = suite / "data_audit" / job["id"]
+            command.extend(["--audit-output", str(audit_output)])
+            update(job, audit_output=str(audit_output))
         update(job, **{f"{action}_status": "running", f"{action}_log": str(log)})
         announce(f"[{action}] {job['id']}  {job['device']}  log={log}")
         try:
@@ -180,6 +191,19 @@ def run_suite(plan, *, check_only=False, max_parallel=5):
                     raise ValueError("Receipt belongs to another experiment")
             if action == "prepare" and not result.get("cohort_hash"):
                 raise ValueError("Preparation did not record the frozen split fingerprint")
+            if action == "audit-data":
+                if result.get("audit_passed") is not True:
+                    raise ValueError("Full DICOM pixel audit did not pass")
+                if result.get("cohort_hash") != manifest["cohort_hash"]:
+                    raise ValueError("The pixel audit uses a different frozen patient split")
+                if (type(result.get("checked_images")) is not int
+                        or result["checked_images"] < 1
+                        or type(result.get("failed_images")) is not int
+                        or result["failed_images"] != 0):
+                    raise ValueError("The pixel audit did not confirm all checked images passed")
+                if (result.get("audit_output") != str(audit_output)
+                        or not (audit_output / "report.json").is_file()):
+                    raise ValueError("The pixel audit did not preserve its technical report")
             if action == "smoke" and result.get("smoke_passed") is not True:
                 raise ValueError("Smoke test did not pass")
             if action == "train":
@@ -210,10 +234,29 @@ def run_suite(plan, *, check_only=False, max_parallel=5):
     print(f"Suite directory: {suite}", flush=True)
     prepared = stage(manifest["jobs"][0], "prepare")
     if prepared is None:
-        manifest["status"] = "failed"
-        save()
+        block_pending("Preparation of the shared patient split failed")
         return suite
-    manifest.update(cohort_hash=prepared["cohort_hash"], status="checking")
+    manifest.update(cohort_hash=prepared["cohort_hash"], status="auditing")
+    save()
+    # Pixel handlers depend on the Conda environment, whereas all jobs use the
+    # same frozen images. Decode the complete cohort once in each environment.
+    # Run these scans serially to avoid concurrent full-cohort disk reads.
+    audit_references = {}
+    for job in manifest["jobs"]:
+        if job["env"] not in audit_references:
+            audit_references[job["env"]] = job
+            stage(job, "audit-data")
+    for job in manifest["jobs"]:
+        reference = audit_references[job["env"]]
+        if job is not reference:
+            job.update(**{"audit-data_status": reference["audit-data_status"],
+                          "audit-data_log": reference["audit-data_log"],
+                          "audit_output": reference["audit_output"],
+                          "audit_reference": reference["id"]})
+    if any(job["audit-data_status"] != "passed" for job in audit_references.values()):
+        block_pending("A planned environment failed the full DICOM pixel audit")
+        return suite
+    manifest["status"] = "checking"
     save()
     # A new random seed does not change the architecture or checkpoint; check
     # one seed per model/mode, then share its receipt with that mode's jobs.
@@ -230,11 +273,7 @@ def run_suite(plan, *, check_only=False, max_parallel=5):
             job.update(smoke_status=reference["smoke_status"], smoke_log=reference["smoke_log"],
                        smoke_reference=reference["id"])
     if any(job["smoke_status"] != "passed" for job in smoke_jobs):
-        for job in manifest["jobs"]:
-            if job["status"] == "pending":
-                job.update(status="blocked", error="A planned model/mode failed preflight")
-        manifest["status"] = "failed"
-        save()
+        block_pending("A planned model/mode failed preflight")
         return suite
     if check_only:
         for job in manifest["jobs"]:
@@ -271,7 +310,7 @@ def main(argv=None):
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--max-parallel", type=int, default=5)
     parser.add_argument("--plan", action="store_true", help="Show resolved jobs without executing or writing files")
-    parser.add_argument("--check-only", action="store_true", help="Prepare data and smoke all models; do not train")
+    parser.add_argument("--check-only", action="store_true", help="Prepare and audit all data, then smoke all models; do not train")
     args = parser.parse_args(argv)
     plan = build_plan(args.config, args.models, args.modes, args.seeds)
     if args.plan:

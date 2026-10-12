@@ -83,6 +83,14 @@ class FakeConda:
             payload = {"action": action}
             if action == "prepare":
                 payload["cohort_hash"] = self.cohort_hash
+            elif action == "audit-data":
+                audit_output = Path(self.argument(command, "--audit-output"))
+                audit_output.mkdir(parents=True, exist_ok=True)
+                report = {"audit_passed": True, "checked_images": 5,
+                          "failed_images": 0, "cohort_hash": self.cohort_hash,
+                          "audit_output": str(audit_output)}
+                (audit_output / "report.json").write_text(json.dumps(report))
+                payload.update(report)
             elif action == "smoke":
                 payload["smoke_passed"] = True
             elif action == "train":
@@ -155,11 +163,17 @@ class FoundationWorkflowTests(unittest.TestCase):
         suite_dir, manifest = self.run_suite(self.plan(), runner)
         actions = [action for action, _, _ in runner.calls]
         self.assertEqual(actions.count("prepare"), 1)
+        self.assertEqual(actions.count("audit-data"), 1)
         self.assertEqual(actions.count("smoke"), 3)
         self.assertEqual(actions.count("train"), 3)
         self.assertEqual(actions[-1], "report")
         completed_smokes = set()
+        audit_complete = False
         for event, identity in runner.events:
+            if event == "end" and identity[0] == "audit-data":
+                audit_complete = True
+            if event == "start" and identity[0] == "smoke":
+                self.assertTrue(audit_complete)
             if event == "end" and identity[0] == "smoke":
                 completed_smokes.add(identity[1:])
             if event == "start" and identity[0] == "train":
@@ -187,11 +201,74 @@ class FoundationWorkflowTests(unittest.TestCase):
         runner = FakeConda(self.root)
         _, manifest = self.run_suite(self.plan(), runner, check_only=True)
         self.assertEqual([call[0] for call in runner.calls].count("prepare"), 1)
+        self.assertEqual([call[0] for call in runner.calls].count("audit-data"), 1)
         self.assertEqual([call[0] for call in runner.calls].count("smoke"), 3)
         self.assertNotIn("train", [call[0] for call in runner.calls])
         self.assertNotIn("report", [call[0] for call in runner.calls])
         self.assertFalse(any(job.get("run_dir") for job in manifest["jobs"]))
         self.assertEqual(manifest["status"], "checked")
+
+    def test_complete_pixel_audit_runs_once_per_environment_for_ten_jobs(self):
+        specifications = [(model, mode, f"cuda:{index}", 42)
+                          for index, model in enumerate(
+                              ("eva_x", "rad_dino", "cxformer", "chexfound", "radjepa"))
+                          for mode in ("linear_probe", "lora")]
+        plan = self.plan(specifications)
+        for job in plan["jobs"]:
+            job["env"] = "radjepa_env" if job["model"] == "radjepa" else "main_env"
+        runner = FakeConda(self.root)
+        suite, manifest = self.run_suite(plan, runner, check_only=True)
+        actions = [call[0] for call in runner.calls]
+        self.assertEqual(actions[:3], ["prepare", "audit-data", "audit-data"])
+        self.assertEqual(actions.count("audit-data"), 2)
+        self.assertEqual(actions.count("smoke"), 10)
+        self.assertNotIn("train", actions)
+        audits = [call for call in runner.calls if call[0] == "audit-data"]
+        self.assertEqual({FakeConda.argument(call[2], "-n") for call in audits},
+                         {"main_env", "radjepa_env"})
+        self.assertEqual(manifest["status"], "checked")
+        self.assertTrue(all(job["audit-data_status"] == "passed" for job in manifest["jobs"]))
+        self.assertEqual(len({job["audit_output"] for job in manifest["jobs"]}), 2)
+        self.assertEqual(sum("audit_reference" not in job for job in manifest["jobs"]), 2)
+        for job in manifest["jobs"]:
+            self.assertTrue((Path(job["audit_output"]) / "report.json").is_file())
+            self.assertTrue(Path(job["audit_output"]).is_relative_to(suite / "data_audit"))
+
+    def test_failed_pixel_audit_blocks_every_smoke_and_training(self):
+        runner = FakeConda(self.root, fail=lambda action, config: action == "audit-data",
+                           failure_log="RuntimeError: synthetic compressed DICOM has no decoder\n")
+        _, manifest = self.run_suite(self.plan(), runner)
+        self.assertEqual([call[0] for call in runner.calls], ["prepare", "audit-data"])
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["jobs"][0]["status"], "failed")
+        self.assertIn("17", manifest["jobs"][0]["error"])
+        self.assertTrue(all(job["audit-data_status"] == "failed" for job in manifest["jobs"]))
+        self.assertTrue(all(job["status"] == "blocked" for job in manifest["jobs"][1:]))
+        self.assertTrue(all("smoke_status" not in job for job in manifest["jobs"]))
+
+    def test_successful_exit_with_invalid_pixel_audit_receipt_blocks_model_checks(self):
+        for problem in ("audit_passed", "cohort", "failed_images", "checked_images", "report"):
+            with self.subTest(problem=problem):
+                def corrupt(action, config, payload):
+                    if action != "audit-data":
+                        return
+                    if problem == "audit_passed":
+                        payload["audit_passed"] = False
+                    elif problem == "cohort":
+                        payload["cohort_hash"] = "different-patient-split"
+                    elif problem == "failed_images":
+                        payload["failed_images"] = 1
+                    elif problem == "checked_images":
+                        payload["checked_images"] = 0
+                    else:
+                        (Path(payload["audit_output"]) / "report.json").unlink()
+
+                runner = FakeConda(self.root, corrupt=corrupt)
+                _, manifest = self.run_suite(self.plan(), runner)
+                self.assertEqual([call[0] for call in runner.calls], ["prepare", "audit-data"])
+                self.assertEqual(manifest["status"], "failed")
+                self.assertEqual(manifest["jobs"][0]["audit-data_status"], "failed")
+                self.assertNotIn("smoke_status", manifest["jobs"][0])
 
     def test_failed_smoke_blocks_all_training(self):
         runner = FakeConda(self.root, fail=lambda action, config:

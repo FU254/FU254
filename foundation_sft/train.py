@@ -412,18 +412,30 @@ def evaluate(config, checkpoint):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="Model JSON configuration")
-    parser.add_argument("--action", choices=("prepare", "smoke", "train", "evaluate"), default="train")
+    parser.add_argument("--action", choices=("prepare", "audit-data", "smoke", "train", "evaluate"), default="train")
     parser.add_argument("--mode", choices=("linear_probe", "lora"))
     parser.add_argument("--device")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--checkpoint", help="Trained best.pt for evaluation")
     parser.add_argument("--resume", help="last.pt to resume with identical training settings")
     parser.add_argument("--result-json", help="Write a machine-readable success receipt for workflow automation")
+    parser.add_argument("--audit-output", help="Fresh directory for a full frozen-split pixel audit")
     args = parser.parse_args(argv)
     config = load_config(args.config, {"device": args.device, "mode": args.mode, "seed": args.seed})
     if args.action == "prepare":
         result = prepare(config)
         receipt = {"cohort_hash": _split_hash(result)}
+    elif args.action == "audit-data":
+        from .audit_data import audit_split
+        split = prepare(config)
+        output = (Path(args.audit_output).expanduser().resolve() if args.audit_output
+                  else _new_run(config, "_data_audit") / "audit")
+        result = audit_split(split, output)
+        receipt = {"cohort_hash": _split_hash(split), "audit_passed": result["audit_passed"],
+                   "checked_images": result["checked_images"], "failed_images": result["failed_images"],
+                   "audit_output": str(output)}
+        print(json.dumps({**receipt, "example_failures": result["failures"][:3]},
+                         ensure_ascii=False, indent=2), flush=True)
     elif args.action == "smoke":
         result = smoke(config)
         receipt = {"smoke_passed": result["smoke_passed"]}
@@ -438,6 +450,12 @@ def main(argv=None):
     if args.result_json:
         _json(args.result_json, {"action": args.action, "model": config["model"],
                                 "mode": config["mode"], "seed": config["seed"], **receipt})
+    if args.action == "audit-data" and not result["audit_passed"]:
+        first = result["failures"][0]
+        raise RuntimeError(f"DICOM pixel audit failed for {result['failed_images']} images. "
+                           f"First failure: {first['split']} row {first['row']}, "
+                           f"{first['transfer_syntax_name']}: {first['error_detail']} "
+                           f"See {receipt['audit_output']}/report.json")
     return result
 
 

@@ -28,6 +28,9 @@ python -m pip install -r foundation_sft/requirements-common.txt
 # 只检查数据匹配并建立公共患者分组，不需要加载模型权重
 python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --action prepare
 
+# 解码全部训练/验证/测试影像；失败时先修复数据，不加载模型权重
+python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --action audit-data
+
 # 用真实数据和本地权重检查前向、反向、冻结参数及保存重载
 python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --action smoke --device cuda:3
 
@@ -50,7 +53,7 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --mode
 4. **Parameters** 先填 `--config foundation_sft/configs/eva_x.json --action prepare`。
 5. **Working directory** 选择服务器上包含 `foundation_sft` 的项目根目录。
 6. **Environment variables** 设置 `LD_LIBRARY_PATH=`（空值）。终端执行的 `unset` 不会自动修改 PyCharm 的运行配置。
-7. 点击运行；数据检查成功后，把参数中的 `--action prepare` 改成 `--action smoke`，之后再改成 `--action train --mode linear_probe` 或 `--action train --mode lora`。
+7. 点击运行；数据匹配成功后，把参数中的 `--action prepare` 改成 `--action audit-data`。全部像素检查通过后，再运行 `--action smoke`，之后运行 `--action train --mode linear_probe` 或 `--action train --mode lora`。
 
 你仍然可以在 PyCharm 中修改代码。Git 用于同步和保存版本；数据和预训练权重继续留在服务器上。
 
@@ -66,7 +69,7 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --mode
 | CheXFound | `train_chexfound.py` | `cuda:3` | `evax_lora` |
 | RadJEPA | `train_radjepa.py` | `cuda:4` | `radjepa_sft` |
 
-入口默认训练 LoRA。先为尚未验证的模型执行 `--action smoke`，通过后再正式训练；服务器目前已收到 CheXFound 的真实权重/GPU 检查通过结果，其余四个仍需各自验证。PyCharm 解释器和空 `LD_LIBRARY_PATH` 的设置同上。GPU 编号可用 `--device` 覆盖，启动前用 `nvidia-smi` 查看可用卡；示例编号不代表服务器当前空闲状态。
+入口默认训练 LoRA。先执行全量数据审核和 `--action smoke`，通过后再正式训练。用户已提供五个模型两种模式共 10 项真实权重/GPU smoke 全部通过的日志，但随后的正式训练遇到了被截断的 DICOM，仍需修复数据后重新检查。PyCharm 解释器和空 `LD_LIBRARY_PATH` 的设置同上。GPU 编号可用 `--device` 覆盖，启动前用 `nvidia-smi` 查看可用卡；示例编号不代表服务器当前空闲状态。
 
 ```bash
 # 在对应环境中运行，可分别在独立终端选择不同模型。
@@ -85,7 +88,7 @@ RadJEPA 入口选用 `radjepa_imagenet.json` 中明确记录的研究预处理�
 
 单个 `train_模型.py` 不只训练：它已经自动进行数据检查、训练/验证、验证集选最佳参数和阈值、最后测试，并保存预测、指标、置信区间及曲线。根目录 `run_foundation_experiments.py` 再将这些步骤串成五模型实验，自动汇总结果。
 
-完整顺序是：读取同一份原始 DICOM/Excel → 建立或校验共同患者划分 → 所有选中模型/模式完成 smoke → 不同 GPU 并行训练，同卡任务顺序执行 → 各实验自动测试 → 汇总全部预定实验。某个 smoke 失败会阻止所有正式训练；正式训练某项失败，其他任务的结果仍会保存，汇总表注明失败项，命令退出非零。
+完整顺序是：读取同一份原始 DICOM/Excel → 建立或校验共同患者划分 → 每个环境解码全部影像 → 所有选中模型/模式完成 smoke → 不同 GPU 并行训练，同卡任务顺序执行 → 各实验自动测试 → 汇总全部预定实验。数据审核或某个 smoke 失败会阻止所有正式训练；正式训练某项失败，其他任务的结果仍会保存，汇总表注明失败项，命令退出非零。
 
 先同步**完整 `foundation_sft` 和根目录 `run_foundation_experiments.py`**，保留已修改的数据路径、权重路径和外部源码。检查 `configs/experiments.json` 的环境名和 GPU 编号。默认前四个模型用 `evax_lora`，RadJEPA 用 `radjepa_sft`，依次分配 `cuda:0` 至 `cuda:4`。这些编号需根据 `nvidia-smi` 的空闲卡修改；同一编号的任务会自动排队。
 
@@ -123,13 +126,44 @@ python run_foundation_experiments.py --seeds 42 43 44
 |---|---|
 | `suite.json` | 每项模型/模式/种子、环境、GPU、准确运行目录及成功/失败状态 |
 | `configs/` | 各任务的完整配置快照 |
-| `logs/` | 每项 prepare、smoke、train 的输出和报错，及报告日志 |
+| `data_audit/` | 每个环境的全量像素审核报告；失败文件的本机路径单独保存 |
+| `logs/` | prepare、各环境 audit-data、smoke、train 的输出和报错，及报告日志 |
 | `report/run_metrics.csv` | 逐次患者测试指标、固定阈值、95% bootstrap CI |
 | `report/model_mode_summary.csv` | 按模型、模式和实验规范汇总；多种子为均值和样本标准差 |
 | `report/patient_roc_<模式>.png`、`patient_pr_<模式>.png` | 同模式所有指定实验的患者 ROC/PR 对比图 |
 | `report/excluded_jobs.csv`、`README.md`、`protocols.json` | 未完成项和原因、中文说明、权重/预处理/训练规范 |
 
 终端打印各阶段状态；失败时会附上对应日志最后 12 行，显示具体异常。训练每轮进展写入日志。用实际打印的路径查看，例如 `tail -f <suite目录>/logs/chexfound_lora_seed42_train.log`。单模型训练目录还保存独立的 ROC/PR/校准图和 `history.json`。
+
+## 全量像素检查与原图恢复
+
+`prepare` 检查 DICOM 头与标签，`smoke` 只检查一个小批次，二者无法证明所有影像完整。统一实验流程现在先在每个不同 Conda 环境里解码全部训练、验证、测试影像；任一失败都会在加载模型、正式训练之前阻止实验。手动检查也可以使用下面的命令，审核目录需使用一个尚未存在的新名字：
+
+```bash
+python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --action audit-data --audit-output runs/foundation_sft/audit_before_restore_01
+```
+
+数据有问题时退出非零属于预期结果，完整检查仍会记录所有失败。`report.json` 只包含分组内行号、标准传输语法、像素参数、实际/声明字节数及已清理的技术原因；`failures_private.csv` 另外保存具体文件路径，权限为仅当前用户读写，留在服务器本地，不需要粘贴或上传。
+
+当前已确认的一张影像为 3032×3032、16 位未压缩数据，PixelData 声明 18,386,048 字节、实际仅 5,419,848 字节。这是文件被截断。原始胸片为 2000 多像素并不影响训练，预处理会变换为各模型的输入尺寸；修改图像头、补零、换解码器均不能恢复丢失的真实像素。
+
+另一个目录 `/data/users/cfu/DR数据` 是候选原图来源，需要先验证。停止或等待当前旧实验结束后运行检查；恢复前保持源目录和目标文件不变。下面第一条只生成恢复计划：
+
+```bash
+python -m foundation_sft.recover_data --audit-dir runs/foundation_sft/audit_before_restore_01 --source-dir /data/users/cfu/DR数据
+```
+
+工具递归检查来源目录，按 SOPInstanceUID 匹配，文件名无需相同。它核对患者/检查标识、像素布局、灰阶和窗口元数据，验证完整解码；对于被截断的 PixelData，还核对原图与损坏文件中保留的像素字节一致。原图有歧义、不完整、无法解码或身份不匹配时，结果为 `unresolved`，不会替换。`counts.ready` 表示找到可恢复的影像，`already_valid` 表示已由其他方式修好。
+
+核对计划后，可在同一条命令末尾添加 `--apply` 恢复已验证文件：
+
+```bash
+python -m foundation_sft.recover_data --audit-dir runs/foundation_sft/audit_before_restore_01 --source-dir /data/users/cfu/DR数据 --apply
+```
+
+每个旧文件都会先保留在本次 `recovery_<时间>_<标识>/backup/`，新文件在目标目录内通过临时副本核对 SHA-256、影像身份、残存像素及解码结果后原子替换。复制期间源/目标变化会拒绝替换。技术汇总为 `summary.json`，具体来源与备份路径仅保存在权限受限的 `recovery_private.csv`。不会删除影像、修改标签或改写旧患者划分。若有 `unresolved` 或 `not_eligible`，先处理对应原因。
+
+恢复会改变文件大小或修改时间，旧划分清单将正确拒绝这些输入变化。保留旧清单和旧实验目录，把 `configs/common.json` 中的 `split_manifest` 改为一个新路径，例如 `runs/foundation_sft/shared_patient_split_restored.csv`；保持 `split_seed=42` 和分组比例。患者、标签和样本成员保持一致时，原有确定性分组算法会给出相同的患者分配，同时记录修复后的文件信息。所有模型都继承这一个共同清单。然后执行 `python run_foundation_experiments.py --check-only`，全量数据和 10 项 smoke 通过后，再执行 `python run_foundation_experiments.py`。新旧输入指纹不同的实验不混入同一比较报告。
 
 已有实验不必重训。将其**事先确定的**完整运行目录显式列出，即可单独汇总；程序会核对共同划分和相同测试患者/标签，不会自动寻找最高测试分。输出目录必须是新目录。
 
@@ -268,11 +302,15 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --acti
 
 ## 已完成的验证
 
-云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 123 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。新增覆盖统一流程的检查屏障、同卡排队与跨卡并行、子进程失败和成功回执、完整测试产物核对，以及比较报告的共同测试患者/标签校验、置信区间和跨种子统计。
+云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 149 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。覆盖统一流程的检查屏障、同卡排队与跨卡并行、子进程失败和成功回执、完整测试产物核对，以及比较报告的共同测试患者/标签校验、置信区间和跨种子统计。
 
-为修复真实服务器日志中的兼容错误，还在独立 Python 3.10.22 / Torch 2.0.1+cpu / torchvision 0.15.2+cpu / timm 0.4.12 / Transformers 4.48.3 环境通过相同的全部 123 项测试，无跳过。15 项 checkpoint 测试覆盖真实 Tensor + NumPy 标量 + set 元数据、协议 2/3/4 加载，以及不支持的对象、嵌套加载和扩展 opcode 拒绝；不会修改 Torch 全局。工作流还验证失败日志末尾异常可见及读取日志失败不改变原任务状态。完整 CXformer-small 也以合成权重完成本地严格加载、LoRA 反向和冻结检查。医学预训练文件和 A6000 内核仍须在服务器验证。
+为修复真实服务器日志中的兼容错误，还在独立 Python 3.10.22 / Torch 2.0.1+cpu / torchvision 0.15.2+cpu / timm 0.4.12 / Transformers 4.48.3 环境通过相同的全部 149 项测试，无跳过。15 项 checkpoint 测试覆盖真实 Tensor + NumPy 标量 + set 元数据、协议 2/3/4 加载，以及不支持的对象、嵌套加载和扩展 opcode 拒绝；不会修改 Torch 全局。工作流还验证失败日志末尾异常可见及读取日志失败不改变原任务状态。完整 CXformer-small 也以合成权重完成本地严格加载、LoRA 反向和冻结检查。云端不含用户的医学预训练文件或 A6000；用户服务器日志已确认五模型两模式的 smoke 通过，正式训练尚因数据损坏受阻。
+
+新增 10 项全量像素审核和 13 项恢复测试覆盖真实物理截断、声明长度不足即使仍能解码也拒绝、各分组完整扫描、异常技术信息清理、不可变清单、只读恢复计划、改名的原图、身份和残存像素校验、歧义副本拒绝、原子替换与旧文件备份，以及复制过程中源/目标改变时拒绝覆盖。在与用户相同的 pydicom 2.4.4 下，这 23 项数据测试也全部通过。统一流程另有 3 项全量审核屏障测试，验证同环境只审核一次、失败时所有模型均停止、无效成功回执不会放行。
 
 统一流程还用合成 DICOM、真实小型 DINOv2 编码器和实际子进程，跑通 prepare → 两种模式 smoke → LP/LoRA 训练及自动测试 → 汇总 CSV 和 ROC/PR 图。测试中将 Conda 启动器替换为隔离 CPU Python 路由；这验证了软件流程，没有验证远端 Conda 环境或五个模型的医学权重。
+
+恢复流程另用实际 CLI 子进程验证：扫描 22 张合成影像，定位 1 张物理截断的文件，只读计划保留原文件；应用恢复保留损坏备份，旧划分 CSV 保持字节不变。使用新清单重新准备后，所有患者/样本/标签的分配与修复前相同，再完成两种模式的训练、自动测试和比较报告。另一个实际工作流检查确认未恢复的数据会阻止任何模型 smoke 或训练启动。
 
 8 项重载校验测试覆盖近零 FP32 logits 的 `4.47e-8` 差异允许通过、显著偏差及 NaN/Inf 拒绝、可训练参数微小漂移和键/形状/dtype 不一致拒绝，以及 CPU 输出仍采用零容差。
 
