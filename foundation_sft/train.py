@@ -379,17 +379,27 @@ def main(argv=None):
     parser.add_argument("--seed", type=int)
     parser.add_argument("--checkpoint", help="Trained best.pt for evaluation")
     parser.add_argument("--resume", help="last.pt to resume with identical training settings")
+    parser.add_argument("--result-json", help="Write a machine-readable success receipt for workflow automation")
     args = parser.parse_args(argv)
     config = load_config(args.config, {"device": args.device, "mode": args.mode, "seed": args.seed})
     if args.action == "prepare":
-        return prepare(config)
-    if args.action == "smoke":
-        return smoke(config)
-    if args.action == "evaluate":
+        result = prepare(config)
+        receipt = {"cohort_hash": _split_hash(result)}
+    elif args.action == "smoke":
+        result = smoke(config)
+        receipt = {"smoke_passed": result["smoke_passed"]}
+    elif args.action == "evaluate":
         if not args.checkpoint:
             parser.error("--action evaluate requires --checkpoint")
-        return evaluate(config, args.checkpoint)
-    return run_training(config, resume=args.resume)
+        result = evaluate(config, args.checkpoint)
+        receipt = {"run_dir": str(result.resolve())}
+    else:
+        result = run_training(config, resume=args.resume)
+        receipt = {"run_dir": str(result.resolve())}
+    if args.result_json:
+        _json(args.result_json, {"action": args.action, "model": config["model"],
+                                "mode": config["mode"], "seed": config["seed"], **receipt})
+    return result
 
 
 if __name__ == "__main__":

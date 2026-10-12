@@ -81,6 +81,64 @@ python train_radjepa.py --help
 
 RadJEPA 入口选用 `radjepa_imagenet.json` 中明确记录的研究预处理，不宣称已核实为作者预训练规范；环境准备和官方规范获取方法见 [MODEL_SOURCES.md](MODEL_SOURCES.md)。RayDINO 尚未确认取得权重，仍可通过统一入口和 `configs/ray_dino.json` 使用，未纳入这五个便捷入口。
 
+## 五个模型的完整实验流程
+
+单个 `train_模型.py` 不只训练：它已经自动进行数据检查、训练/验证、验证集选最佳参数和阈值、最后测试，并保存预测、指标、置信区间及曲线。根目录 `run_foundation_experiments.py` 再将这些步骤串成五模型实验，自动汇总结果。
+
+完整顺序是：读取同一份原始 DICOM/Excel → 建立或校验共同患者划分 → 所有选中模型/模式完成 smoke → 不同 GPU 并行训练，同卡任务顺序执行 → 各实验自动测试 → 汇总全部预定实验。某个 smoke 失败会阻止所有正式训练；正式训练某项失败，其他任务的结果仍会保存，汇总表注明失败项，命令退出非零。
+
+先同步**完整 `foundation_sft` 和根目录 `run_foundation_experiments.py`**，保留已修改的数据路径、权重路径和外部源码。检查 `configs/experiments.json` 的环境名和 GPU 编号。默认前四个模型用 `evax_lora`，RadJEPA 用 `radjepa_sft`，依次分配 `cuda:0` 至 `cuda:4`。这些编号需根据 `nvidia-smi` 的空闲卡修改；同一编号的任务会自动排队。
+
+默认运行五模型的线性探测和 LoRA，共 10 组，训练种子 42、固定划分种子 42。可通过参数改为仅 LoRA 或预先指定多个种子。RadJEPA 的研究归一化设置会在对比表和图中注明。
+
+```bash
+conda activate evax_lora
+unset LD_LIBRARY_PATH
+cd /home/cfu/EVA-X-main
+
+# 查看计划，不加载权重、不训练。
+python run_foundation_experiments.py --plan
+
+# 先检查所有模型的真实数据/权重/GPU，成功状态为 checked。
+python run_foundation_experiments.py --check-only
+
+# 完整实验：默认五模型 × 线性探测和 LoRA，共 10 组。
+python run_foundation_experiments.py
+
+# 也可以先完成当前五模型 LoRA 实验，共 5 组。
+python run_foundation_experiments.py --modes lora
+
+# 只运行某个模型的完整流程；仍使用共同数据划分。
+python run_foundation_experiments.py --models chexfound --modes lora
+
+# 预先指定重复训练的种子；划分种子和测试集保持相同。
+python run_foundation_experiments.py --seeds 42 43 44
+```
+
+运行多种子或两种训练方式时，先确定方案再开始，不能根据测试指标选择较好的种子。每次调用都会产生新的实验目录；`--check-only` 后正式运行会再次 smoke。运行中不修改配置，程序已保存每项合并配置的快照。每个子进程会清除冲突的 `LD_LIBRARY_PATH`，使用本地权重离线运行，不安装依赖或下载模型。
+
+程序打印 `Suite directory`，形式为 `runs/foundation_sft/suites/suite_<时间>_<标识>/`。每项的真实训练目录保留在 `suite.json`；RadJEPA 的训练文件继续使用其独立结果根目录。无需再手动执行 `evaluate`，训练已经自动测试。
+
+| 文件或目录 | 内容 |
+|---|---|
+| `suite.json` | 每项模型/模式/种子、环境、GPU、准确运行目录及成功/失败状态 |
+| `configs/` | 各任务的完整配置快照 |
+| `logs/` | 每项 prepare、smoke、train 的输出和报错，及报告日志 |
+| `report/run_metrics.csv` | 逐次患者测试指标、固定阈值、95% bootstrap CI |
+| `report/model_mode_summary.csv` | 按模型、模式和实验规范汇总；多种子为均值和样本标准差 |
+| `report/patient_roc_<模式>.png`、`patient_pr_<模式>.png` | 同模式所有指定实验的患者 ROC/PR 对比图 |
+| `report/excluded_jobs.csv`、`README.md`、`protocols.json` | 未完成项和原因、中文说明、权重/预处理/训练规范 |
+
+终端仅打印各阶段状态，训练每轮进展写入日志。用实际打印的路径查看，例如 `tail -f <suite目录>/logs/chexfound_lora_seed42_train.log`。单模型训练目录还保存独立的 ROC/PR/校准图和 `history.json`。
+
+已有实验不必重训。将其**事先确定的**完整运行目录显式列出，即可单独汇总；程序会核对共同划分和相同测试患者/标签，不会自动寻找最高测试分。输出目录必须是新目录。
+
+```bash
+python -m foundation_sft.report --runs <EVA-X运行目录> <CheXFound运行目录> --output runs/comparison_manual_01
+```
+
+中断训练沿用下文的 `--resume` 和准确 `last.pt` 路径。重新运行 suite 会建立新实验，不会自动继续旧任务或跳过已完成任务。
+
 ## 其他五个模型
 
 权重和依赖准备方法见 [MODEL_SOURCES.md](MODEL_SOURCES.md)。目前你已有 EVA-X Base，已在 Windows 电脑下载 RAD-DINO、CXformer Base、RadJEPA 的官方完整目录；还需要上传服务器并逐个验证。准备完成后，替换命令中的配置文件即可：
@@ -154,7 +212,9 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --acti
 
 ## 已完成的验证
 
-云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 68 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。
+云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 88 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。新增覆盖统一流程的检查屏障、同卡排队与跨卡并行、子进程失败和成功回执、完整测试产物核对，以及比较报告的共同测试患者/标签校验、置信区间和跨种子统计。
+
+统一流程还用合成 DICOM、真实小型 DINOv2 编码器和实际子进程，跑通 prepare → 两种模式 smoke → LP/LoRA 训练及自动测试 → 汇总 CSV 和 ROC/PR 图。测试中将 Conda 启动器替换为隔离 CPU Python 路由；这验证了软件流程，没有验证远端 Conda 环境或五个模型的医学权重。
 
 另外，RayDINO 官方 `xray_dino_vitl16` 完整 ViT-L/16 架构已用随机初始化和小尺寸合成输入完成 24 层 LoRA 前向、反向、冻结参数及重载一致性检查。这些检查不代表已加载医学预训练权重，也不代表已经在你的 SSH 服务器完成训练。
 

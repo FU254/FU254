@@ -1,0 +1,13 @@
+{
+  "modes": ["linear_probe", "lora"],
+  "seeds": [42],
+  "suite_root": "runs/foundation_sft/suites",
+  "conda_executable": "/opt/anaconda3/bin/conda",
+  "jobs": [
+    {"model": "eva_x", "config": "foundation_sft/configs/eva_x.json", "env": "evax_lora", "device": "cuda:0"},
+    {"model": "rad_dino", "config": "foundation_sft/configs/rad_dino.json", "env": "evax_lora", "device": "cuda:1"},
+    {"model": "cxformer", "config": "foundation_sft/configs/cxformer.json", "env": "evax_lora", "device": "cuda:2"},
+    {"model": "chexfound", "config": "foundation_sft/configs/chexfound.json", "env": "evax_lora", "device": "cuda:3"},
+    {"model": "radjepa", "config": "foundation_sft/configs/radjepa_imagenet.json", "env": "radjepa_sft", "device": "cuda:4"}
+  ]
+}
