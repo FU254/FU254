@@ -8,6 +8,8 @@
 - 官方权重：[MapleF/eva_x](https://huggingface.co/MapleF/eva_x)。你现有 `base` 使用 `eva_x_base_patch16_merged520k_mim.pt`。
 - 架构 ViT-B/16，224 输入，12 层、768 通道、独立 Q/K/V；LoRA 注入 36 个投影。
 - 在 `configs/eva_x.json` 填本地 `checkpoint`；分类预训练头可以忽略，编码器参数必须完整匹配。
+- 先检查权重的完整归一化参数对。MIM 发布含 `norm.weight/bias`，据此构造逐 token LayerNorm（`use_mean_pooling=False`）；分类导出含 `fc_norm.weight/bias`，据此保留池化后的 LayerNorm。不会把两者互相重命名；`mean(LN(tokens))` 与 `LN(mean(tokens))` 不等价。两种布局同时出现、不完整或缺失会拒绝。
+- 特征编码器没有 MIM 任务的 `mask_token`、`lm_head.weight/bias` 和旧分类 `head.weight/bias`，仅精确移除这些已知键；其他参数缺失、意外键或形状错误继续报错。选择的归一化布局和忽略键保存在模型指纹中。
 - 保留已修正的原生注意力回退，不需要因安装 xformers 而回滚。
 - 旧官方 checkpoint 可能同时保存 NumPy 数值标量和普通 Python `set` 元数据。加载器先使用 Torch 的 `weights_only=True`；遇到这些已知类型或协议 4 FRAME 限制时，以同一个局部受限加载方式兼容，仍只返回编码器张量，不需要改写权重文件。
 
@@ -120,7 +122,7 @@ python -m foundation_sft.train --config foundation_sft/configs/radjepa_imagenet.
 
 ## 共同的检查顺序
 
-每个模型填好路径后先运行 `--action smoke`，再启动监督训练。没有医学权重的云端测试只验证代码和架构，不验证医学任务表现。用户已在服务器上报告 CheXFound 的真实 teacher 权重加载、512 输入、24 层 LoRA、GPU 前向/反向及保存重载检查通过。助手仍没有连接该 SSH 服务器；EVA-X 的新框架、RAD-DINO、CXformer、RadJEPA 和 RayDINO 尚未收到对应的服务器检查通过结果。
+每个模型填好路径后先运行 `--action smoke`，再启动监督训练。没有医学权重的云端测试只验证代码和架构，不验证医学任务表现。用户已在服务器上报告 RAD-DINO、CXformer、CheXFound、RadJEPA 的线性探测及 LoRA 检查均通过，包括真实权重加载、GPU 前向/反向和保存重载。助手仍没有连接该 SSH 服务器；EVA-X 最新失败是 MIM 归一化结构与分类构造不一致，代码已按上述权重结构适配，等待服务器重新检查。RayDINO 未确认取得权重。
 
 HF 依赖固定为 Transformers **4.48.3**、huggingface-hub 0.29.3、tokenizers 0.21.1 和 safetensors 0.4.5。此前的 4.50.3 在用户 Torch 2.0.1 环境导入时访问不存在的 `torch.compiler`，已据真实日志修正。4.48.3 已在独立 Python 3.10.22 / Torch 2.0.1+cpu / torchvision 0.15.2+cpu / timm 0.4.12 环境验证 DINOv2 与带 register 的 DINOv2 导入、本地权重加载、特征和 LoRA 反向；这些 CPU 软件检查不代表服务器医学权重或 CUDA 计算已经通过。更旧的 4.44/4.46 缺少 CXformer 所需内置 register 架构，不作为替代版本。
 

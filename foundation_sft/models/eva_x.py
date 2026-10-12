@@ -53,10 +53,36 @@ def build_eva_x(config):
     path = Path(config.get("checkpoint", "")).expanduser()
     if not path.is_file():
         raise FileNotFoundError("Set checkpoint to your eva_x_base_patch16_merged520k_mim.pt file")
-    backbone = eva02_base_patch16_xattn_fusedLN_NaiveSwiGLU_subln_RoPE(pretrained=False)
     state = load_checkpoint(path, config.get("state_key"))
-    load_backbone_weights(backbone, state, ignored_prefixes=("head.",))
+    normalization = _normalization_layout(state)
+    backbone = eva02_base_patch16_xattn_fusedLN_NaiveSwiGLU_subln_RoPE(
+        pretrained=False, num_classes=0, use_mean_pooling=normalization == "pooled_norm")
+    # MIM mask/decoder and downstream classification heads are unused by the
+    # feature encoder. Every other tensor, including its actual pretrained norm,
+    # must match; norm before token pooling is not interchangeable with fc_norm.
+    unused_keys = {"mask_token", "lm_head.weight", "lm_head.bias", "head.weight", "head.bias"}
+    ignored = sorted(set(state) & unused_keys)
+    encoder_state = {key: value for key, value in state.items() if key not in unused_keys}
+    load_backbone_weights(backbone, encoder_state, ignored_prefixes=())
     return EVAXAdapter(backbone, {"model": "eva_x_base_patch16", "checkpoint": str(path.resolve()),
                                  "sha256": sha256_file(path),
+                                 "normalization_layout": normalization,
+                                 "ignored_checkpoint_keys": ignored,
                                  "source": "https://huggingface.co/MapleF/eva_x"},
                        pooling=config.get("pooling", "patch_mean"))
+
+
+def _normalization_layout(state):
+    """Keep the checkpoint's token norm or pooled norm at its original position."""
+    layouts = []
+    for prefix, layout in (("norm", "token_norm"), ("fc_norm", "pooled_norm")):
+        required = {f"{prefix}.weight", f"{prefix}.bias"}
+        present = required & set(state)
+        if present and present != required:
+            raise ValueError(f"Incomplete EVA-X {prefix} normalization weights: missing {sorted(required - present)}")
+        if present:
+            layouts.append(layout)
+    if len(layouts) != 1:
+        raise ValueError("EVA-X checkpoint must contain exactly one complete normalization pair: "
+                         "norm.weight/norm.bias or fc_norm.weight/fc_norm.bias")
+    return layouts[0]
