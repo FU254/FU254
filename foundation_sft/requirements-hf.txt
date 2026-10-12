@@ -1,4 +1,6 @@
-transformers==4.50.3
+# Verified with Python 3.10, PyTorch 2.0.1 and EVA-X's timm 0.4.12.
+# 4.50.x imports torch.compiler; earlier releases can lack register-token DINOv2.
+transformers==4.48.3
 huggingface-hub==0.29.3
 tokenizers==0.21.1
 safetensors==0.4.5

@@ -1,10 +1,15 @@
 """Encoder contract, trainable heads, and architecture-aware LoRA primitives."""
 
 from dataclasses import asdict, dataclass
+from collections import OrderedDict
 from pathlib import Path
 import hashlib
 import math
+import pickle
+from types import SimpleNamespace
+import zipfile
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -190,11 +195,140 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def _numeric_dtype(value, *args):
+    dtype = np.dtype(value, *args)
+    if dtype.kind not in "biufc" or dtype.hasobject or dtype.fields is not None or dtype.subdtype is not None:
+        raise pickle.UnpicklingError("Only plain numeric NumPy dtypes are permitted in checkpoint metadata")
+    return dtype
+
+
+def _numeric_scalar(dtype, data):
+    dtype = _numeric_dtype(dtype)
+    if not isinstance(data, bytes) or len(data) != dtype.itemsize:
+        raise pickle.UnpicklingError("Invalid numeric NumPy scalar payload")
+    return np.core.multiarray.scalar(dtype, data)
+
+
+def _checkpoint_bytes(value, encoding="latin1", errors="strict"):
+    # NumPy's protocol-2 pickle encodes scalar bytes through _codecs.encode.
+    # Other encodings could invoke a user-installed codec during deserialization.
+    if not isinstance(value, str) or encoding != "latin1" or errors != "strict":
+        raise pickle.UnpicklingError("Only literal latin1 bytes are permitted in checkpoint metadata")
+    return value.encode("latin1")
+
+
+def _numeric_checkpoint_globals():
+    allowed = {
+        "collections.OrderedDict": OrderedDict,
+        "numpy.dtype": _numeric_dtype,
+        "numpy.core.multiarray.scalar": _numeric_scalar,
+        "numpy._core.multiarray.scalar": _numeric_scalar,
+        "_codecs.encode": _checkpoint_bytes,
+        "torch._utils._rebuild_tensor": torch._utils._rebuild_tensor,
+        "torch._utils._rebuild_tensor_v2": torch._utils._rebuild_tensor_v2,
+        "torch._utils._rebuild_parameter": torch._utils._rebuild_parameter,
+        "torch.storage.UntypedStorage": torch.UntypedStorage,
+        "torch.UntypedStorage": torch.UntypedStorage,
+    }
+    if hasattr(torch._utils, "_rebuild_tensor_v3"):
+        allowed["torch._utils._rebuild_tensor_v3"] = torch._utils._rebuild_tensor_v3
+    for name in ("float16", "float32", "float64", "bfloat16", "int8", "int16", "int32", "int64",
+                 "uint8", "bool", "complex64", "complex128"):
+        allowed[f"torch.{name}"] = getattr(torch, name)
+    return allowed
+
+
+class _NumericCheckpointUnpickler(pickle._Unpickler):
+    """Local tensor/numeric-metadata loader for PyTorch versions without safe_globals.
+
+    Besides an exact GLOBAL allowlist, restrict REDUCE, BUILD and storage IDs.
+    In particular, never permit NumPy arrays, nested pickle/storage loaders, or
+    extension opcodes that could bypass find_class through pickle's global cache.
+    """
+
+    dispatch = pickle._Unpickler.dispatch.copy()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.allowed_globals = _numeric_checkpoint_globals()
+
+    def find_class(self, module, name):
+        key = f"{module}.{name}"
+        if key not in self.allowed_globals:
+            raise pickle.UnpicklingError(f"Unsupported checkpoint global: {key}")
+        return self.allowed_globals[key]
+
+    def load_reduce(self):
+        args = self.stack.pop()
+        function = self.stack[-1]
+        if not any(function is allowed for allowed in self.allowed_globals.values()):
+            raise pickle.UnpicklingError("Unrecognized checkpoint reconstruction function")
+        self.stack[-1] = function(*args)
+
+    def load_build(self):
+        state = self.stack.pop()
+        instance = self.stack[-1]
+        if isinstance(instance, np.dtype):
+            # NumPy dtype's ordinary scalar state contains no fields/subarrays.
+            if not isinstance(state, tuple) or len(state) != 8 or any(value is not None for value in state[2:5]):
+                raise pickle.UnpicklingError("Structured NumPy dtype metadata is not permitted")
+            instance.__setstate__(state)
+            _numeric_dtype(instance)
+        elif type(instance) is OrderedDict and isinstance(state, dict):
+            instance.__dict__.update(state)
+        elif type(instance) is torch.Tensor:
+            instance.set_(*state)
+        elif type(instance) is torch.nn.Parameter:
+            instance.__setstate__(state)
+        else:
+            raise pickle.UnpicklingError("Unsupported checkpoint object state")
+
+    def load_binpersid(self):
+        saved_id = self.stack.pop()
+        if not isinstance(saved_id, tuple) or not saved_id or saved_id[0] not in ("storage", b"storage"):
+            raise pickle.UnpicklingError("Only tensor-storage persistent IDs are permitted")
+        self.append(self.persistent_load(saved_id))
+
+    def reject_object_opcode(self):
+        raise pickle.UnpicklingError("Unsupported checkpoint object/extension opcode")
+
+    dispatch[pickle.REDUCE[0]] = load_reduce
+    dispatch[pickle.BUILD[0]] = load_build
+    dispatch[pickle.BINPERSID[0]] = load_binpersid
+    for opcode in (pickle.INST, pickle.OBJ, pickle.NEWOBJ, pickle.NEWOBJ_EX,
+                   pickle.EXT1, pickle.EXT2, pickle.EXT4, pickle.PERSID):
+        dispatch[opcode[0]] = reject_object_opcode
+
+
+def _load_numeric_checkpoint(path):
+    # Restrict compatibility loading to Torch ZIP checkpoints. The obsolete tar
+    # loader extracts members and is unnecessary for the EVA-X release format.
+    if not zipfile.is_zipfile(path):
+        raise pickle.UnpicklingError("Numeric metadata compatibility requires a Torch ZIP checkpoint")
+    restricted_pickle = SimpleNamespace(
+        __name__="foundation_numeric_checkpoint_pickle", Unpickler=_NumericCheckpointUnpickler,
+    )
+    # weights_only=False selects OUR restricted unpickler, not Python's ordinary
+    # pickle module; arbitrary GLOBAL/REDUCE calls remain rejected on Torch 2.0.
+    return torch.load(path, map_location="cpu", weights_only=False, pickle_module=restricted_pickle)
+
+
 def load_checkpoint(path, state_key=None):
     path = Path(path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Pretrained checkpoint not found: {path}")
-    state = torch.load(path, map_location="cpu", weights_only=True)
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError as error:
+        # Official older training checkpoints also save numerical metrics as
+        # numpy.float64 outside the tensor state dict. PyTorch 2.0 has no local
+        # safe_globals context; handle just that known restriction, never a
+        # generic deserialization failure or an unknown application class.
+        message = str(error)
+        numeric_globals = ("numpy.core.multiarray.scalar", "numpy._core.multiarray.scalar", "numpy.dtype")
+        if not any(name in message for name in numeric_globals):
+            raise
+        state = _load_numeric_checkpoint(path)
     if state_key:
         for part in state_key.split("."):
             state = state[part]

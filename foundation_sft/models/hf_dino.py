@@ -247,14 +247,14 @@ def build_hf_dino(config: dict[str, Any]) -> BackboneAdapter:
     except (ValueError, KeyError) as error:
         raise ValueError(
             f"Installed Transformers cannot read model_type={model_type!r}; "
-            "register-token models require Transformers 4.50.3 or a verified compatible version."
+            "register-token models require Transformers 4.48.3 or a verified compatible version."
         ) from error
     processor = AutoImageProcessor.from_pretrained(
         str(model_dir), use_fast=False, **local_options
     )
     preprocess = _processor_spec(processor, encoder_config)
     # AutoModel.from_pretrained enumerates unrelated model configurations in
-    # Transformers 4.50.3, importing a timm wrapper incompatible with EVA-X's
+    # Recent Transformers, importing a timm wrapper incompatible with EVA-X's
     # pinned timm 0.4.12. The two concrete verified classes avoid that dependency.
     if model_type == "dinov2":
         from transformers import Dinov2Model as encoder_type

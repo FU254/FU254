@@ -170,6 +170,46 @@ python -m foundation_sft.train --config foundation_sft/configs/cxformer.json --d
 
 修改运行种子用 `--seed 43`。比较不同种子时保留 `split_seed` 和 `split_manifest`，确保数据分组一致。
 
+## 修复服务器第一次统一检查的错误
+
+用户的第一次五模型检查已完成数据准备并通过 CheXFound，另外四项失败。实际日志分别是 EVA-X 的 NumPy 标量元数据不被 Torch `weights_only` 支持，RAD-DINO/CXformer 的 Transformers 4.50.3 访问 Torch 2.0.1 不存在的 `torch.compiler`，以及尚未创建 `radjepa_sft`。这些是三项不同的问题。
+
+先同步新版 `models/common.py` 和 `requirements-hf.txt` 到服务器对应的 `foundation_sft` 目录。保留自己的 JSON 配置、数据划分、模型源码和权重；EVA-X 加载兼容代码不需要改写权重文件。随后按顺序执行：
+
+```bash
+cd /home/cfu/EVA-X-main
+conda activate evax_lora
+unset LD_LIBRARY_PATH
+python -m pip install -r foundation_sft/requirements-hf.txt
+python -m pip check
+```
+
+新的 HF 固定组合为 Transformers 4.48.3 / hub 0.29.3 / tokenizers 0.21.1 / safetensors 0.4.5。只调整上述 HF 包，沿用已可用的 Torch 2.0.1、CUDA、torchvision 和 xformers；不要为此更新整套 Torch 环境。该组合已在独立 Python 3.10 / Torch 2.0.1 CPU 环境实际通过导入、LP/LoRA、本地权重加载和完整已有测试；远端 GPU 仍需下述检查。
+
+如果 `radjepa_sft` 不存在，从修好依赖的 `evax_lora` 克隆后，只在新环境中更新 timm：
+
+```bash
+conda create --name radjepa_sft --clone evax_lora -y
+conda activate radjepa_sft
+unset LD_LIBRARY_PATH
+python -m pip install -r foundation_sft/requirements-hf.txt
+python -m pip install --no-deps "timm==1.0.24"
+python -m pip check
+```
+
+若该环境已经创建，跳过 `conda create`，仍检查其 HF 依赖和 timm。然后回到主环境，执行已确定的五模型 × 两种方式方案：
+
+```bash
+conda activate evax_lora
+unset LD_LIBRARY_PATH
+cd /home/cfu/EVA-X-main
+python run_foundation_experiments.py --check-only
+# 上一项全部检查通过后，运行正式 10 组实验；不加 --modes lora。
+python run_foundation_experiments.py
+```
+
+重新检查会生成新 suite，不会覆盖旧失败记录或改动患者划分。仍有错误时查看新 suite 的对应 `logs/`，按实际异常处理。
+
 ## 数据和实验约定
 
 - Excel 的“放射编号”与 DICOM 的 `AccessionNumber` 匹配，“阻塞性通气障碍”必须为 0 或 1。未匹配到 Excel 的影像跳过，避免沿用上一张影像的标签。
@@ -212,7 +252,9 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --acti
 
 ## 已完成的验证
 
-云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 88 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。新增覆盖统一流程的检查屏障、同卡排队与跨卡并行、子进程失败和成功回执、完整测试产物核对，以及比较报告的共同测试患者/标签校验、置信区间和跨种子统计。
+云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 99 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。新增覆盖统一流程的检查屏障、同卡排队与跨卡并行、子进程失败和成功回执、完整测试产物核对，以及比较报告的共同测试患者/标签校验、置信区间和跨种子统计。
+
+为修复真实服务器日志中的兼容错误，还在独立 Python 3.10.22 / Torch 2.0.1+cpu / torchvision 0.15.2+cpu / timm 0.4.12 / Transformers 4.48.3 环境通过相同的全部 99 项测试，无跳过。11 项新增测试覆盖真实 Tensor + NumPy 标量 checkpoint 加载，以及不支持的对象、嵌套加载和扩展 opcode 拒绝；不会修改 Torch 全局。完整 CXformer-small 也以合成权重完成本地严格加载、LoRA 反向和冻结检查。医学预训练文件和 A6000 内核仍须在服务器验证。
 
 统一流程还用合成 DICOM、真实小型 DINOv2 编码器和实际子进程，跑通 prepare → 两种模式 smoke → LP/LoRA 训练及自动测试 → 汇总 CSV 和 ROC/PR 图。测试中将 Conda 启动器替换为隔离 CPU Python 路由；这验证了软件流程，没有验证远端 Conda 环境或五个模型的医学权重。
 

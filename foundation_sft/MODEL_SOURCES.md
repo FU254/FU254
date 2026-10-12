@@ -9,6 +9,7 @@
 - 架构 ViT-B/16，224 输入，12 层、768 通道、独立 Q/K/V；LoRA 注入 36 个投影。
 - 在 `configs/eva_x.json` 填本地 `checkpoint`；分类预训练头可以忽略，编码器参数必须完整匹配。
 - 保留已修正的原生注意力回退，不需要因安装 xformers 而回滚。
+- 旧官方 checkpoint 可能同时保存 NumPy 数值标量元数据。加载器先使用 Torch 的 `weights_only=True`；遇到这种受限类型时，以局部受限加载方式兼容数值元数据，仍只返回编码器张量，不需要改写权重文件。
 
 ## RAD-DINO
 
@@ -102,7 +103,7 @@ PY
 - 官方说明建议 `timm==1.0.24`。EVA-X 使用 `timm==0.4.12`，建议为 RadJEPA 单独建环境，保留现有可运行环境：
 
 ```bash
-conda create --name radjepa_sft --clone evax_lora
+conda create --name radjepa_sft --clone evax_lora -y
 conda activate radjepa_sft
 unset LD_LIBRARY_PATH
 python -m pip install -r foundation_sft/requirements-hf.txt
@@ -121,6 +122,6 @@ python -m foundation_sft.train --config foundation_sft/configs/radjepa_imagenet.
 
 每个模型填好路径后先运行 `--action smoke`，再启动监督训练。没有医学权重的云端测试只验证代码和架构，不验证医学任务表现。用户已在服务器上报告 CheXFound 的真实 teacher 权重加载、512 输入、24 层 LoRA、GPU 前向/反向及保存重载检查通过。助手仍没有连接该 SSH 服务器；EVA-X 的新框架、RAD-DINO、CXformer、RadJEPA 和 RayDINO 尚未收到对应的服务器检查通过结果。
 
-HF 依赖固定为 Transformers 4.50.3、huggingface-hub 0.29.3、tokenizers 0.21.1 和 safetensors 0.4.5，以保留对现有 Torch 2.0 的接口支持；云端实际验证使用 Torch 2.9.1 CPU，服务器兼容性仍需实际检查。
+HF 依赖固定为 Transformers **4.48.3**、huggingface-hub 0.29.3、tokenizers 0.21.1 和 safetensors 0.4.5。此前的 4.50.3 在用户 Torch 2.0.1 环境导入时访问不存在的 `torch.compiler`，已据真实日志修正。4.48.3 已在独立 Python 3.10.22 / Torch 2.0.1+cpu / torchvision 0.15.2+cpu / timm 0.4.12 环境验证 DINOv2 与带 register 的 DINOv2 导入、本地权重加载、特征和 LoRA 反向；这些 CPU 软件检查不代表服务器医学权重或 CUDA 计算已经通过。更旧的 4.44/4.46 缺少 CXformer 所需内置 register 架构，不作为替代版本。
 
 每次训练保存权重和预处理指纹、LoRA 投影名称和输入网格，重新评估时核对。默认目录 `foundation_sources/`、`foundation_weights/` 和 `runs/` 已加入 Git 排除项。
