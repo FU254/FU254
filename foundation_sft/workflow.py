@@ -5,6 +5,7 @@ its configured Conda environment; no Torch installation is needed to plan jobs.
 """
 
 import argparse
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
@@ -98,6 +99,15 @@ def _command(command, log):
         raise RuntimeError(f"Process exited {result.returncode}; see {log}")
 
 
+def _last_log_lines(log, limit=12):
+    """Read a bounded failure excerpt without replacing the original failure."""
+    try:
+        with Path(log).open(encoding="utf-8", errors="replace") as handle:
+            return "".join(deque(handle, maxlen=limit)).rstrip("\n")
+    except OSError as error:
+        return f"Log unavailable: {error}"
+
+
 def _parallel_by_device(jobs, operation, max_parallel):
     groups = {}
     for job in jobs:
@@ -136,6 +146,12 @@ def run_suite(plan, *, check_only=False, max_parallel=5):
         _write_json(job["config_file"], planned["config"])
         manifest["jobs"].append(job)
     lock = threading.Lock()
+    console_lock = threading.Lock()
+
+    def announce(message):
+        # Keep each failure and its excerpt together when several GPUs fail.
+        with console_lock:
+            print(message, flush=True)
 
     def save():
         _write_json(suite / "suite.json", manifest)
@@ -152,7 +168,7 @@ def run_suite(plan, *, check_only=False, max_parallel=5):
                    "python", "-m", "foundation_sft.train", "--config", job["config_file"],
                    "--action", action, "--result-json", str(receipt)]
         update(job, **{f"{action}_status": "running", f"{action}_log": str(log)})
-        print(f"[{action}] {job['id']}  {job['device']}  log={log}", flush=True)
+        announce(f"[{action}] {job['id']}  {job['device']}  log={log}")
         try:
             _command(command, log)
             with receipt.open(encoding="utf-8") as handle:
@@ -180,11 +196,14 @@ def run_suite(plan, *, check_only=False, max_parallel=5):
                     raise ValueError("The trained run uses a different frozen patient split")
                 update(job, status="completed", run_dir=str(run))
             update(job, **{f"{action}_status": "passed"})
-            print(f"[{action} passed] {job['id']}", flush=True)
+            announce(f"[{action} passed] {job['id']}")
             return result
         except (OSError, ValueError, KeyError, RuntimeError) as error:
             update(job, status="failed", error=str(error), **{f"{action}_status": "failed"})
-            print(f"[{action} failed] {job['id']}: {error}", flush=True)
+            excerpt = _last_log_lines(log)
+            announce(f"[{action} failed] {job['id']}: {error}\n"
+                     f"[Last log lines] {job['id']}  model={job['model']}  "
+                     f"mode={job['mode']}  action={action}\n{excerpt}")
             return None
 
     save()

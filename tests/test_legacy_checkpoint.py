@@ -1,6 +1,7 @@
 """Real legacy NumPy metadata and restricted checkpoint deserialization."""
 
 from collections import OrderedDict
+from argparse import Namespace
 import codecs
 import copyreg
 import io
@@ -72,6 +73,45 @@ class LegacyCheckpointTests(unittest.TestCase):
         torch.save({"teacher": {"backbone": self.state}, "best_auc": np.float64(0.9)}, self.path)
         loaded = load_checkpoint(self.path, "teacher.backbone")
         torch.testing.assert_close(loaded["weight"], self.state["module.weight"])
+
+    def test_real_numpy_and_set_metadata_across_pickle_protocols(self):
+        # Protocol 2 uses __builtin__.set, protocol 3 uses builtins.set, and
+        # protocol 4 uses FRAME plus EMPTY_SET/ADDITEMS. Both metadata orders
+        # matter: Torch 2.0 rejects whichever appears first.
+        for protocol in (2, 3, 4):
+            for set_first in (False, True):
+                with self.subTest(protocol=protocol, set_first=set_first):
+                    metadata = {"best_auc": np.float64(0.875), "missing_keys": {"head.weight", "head.bias"}}
+                    if set_first:
+                        metadata = dict(reversed(list(metadata.items())))
+                    torch.save({"model": self.state, **metadata}, self.path, pickle_protocol=protocol)
+                    loaded = load_checkpoint(self.path)
+                    for key, tensor in loaded.items():
+                        torch.testing.assert_close(tensor, self.state["module." + key])
+
+    def test_set_metadata_without_numpy_across_pickle_protocols(self):
+        for protocol in (2, 3, 4):
+            with self.subTest(protocol=protocol):
+                torch.save({"model": self.state, "missing_keys": {"head.weight"},
+                            "ignored_keys": set()}, self.path, pickle_protocol=protocol)
+                loaded = load_checkpoint(self.path)
+                torch.testing.assert_close(loaded["weight"], self.state["module.weight"])
+
+    def test_malicious_reduce_after_set_is_rejected_across_pickle_protocols(self):
+        marker = self.root / "executed.txt"
+        for protocol in (2, 3, 4):
+            with self.subTest(protocol=protocol):
+                torch.save({"missing_keys": {"head.weight"}, "best_auc": np.float64(0.9),
+                            "model": self.state, "attack": _ExecuteOnUnpickle(marker)},
+                           self.path, pickle_protocol=protocol)
+                with self.assertRaisesRegex(pickle.UnpicklingError, "Unsupported checkpoint global:.*eval"):
+                    load_checkpoint(self.path)
+                self.assertFalse(marker.exists())
+
+    def test_protocol_four_unknown_application_class_remains_rejected(self):
+        torch.save({"model": self.state, "args": Namespace(epoch=12)}, self.path, pickle_protocol=4)
+        with self.assertRaisesRegex(pickle.UnpicklingError, "Unsupported checkpoint global:.*Namespace"):
+            load_checkpoint(self.path)
 
     def test_malicious_reduce_after_scalar_is_rejected_without_execution(self):
         marker = self.root / "executed.txt"

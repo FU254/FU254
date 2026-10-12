@@ -25,13 +25,14 @@ class FakeConda:
     """Create the same receipts/artifacts as the CLI, recording real overlap."""
 
     def __init__(self, root, *, fail=None, omit_receipt=None, corrupt=None,
-                 training_delay=0.0, report_failed=False):
+                 training_delay=0.0, report_failed=False, failure_log=None):
         self.root = Path(root)
         self.fail = fail
         self.omit_receipt = omit_receipt
         self.corrupt = corrupt
         self.training_delay = training_delay
         self.report_failed = report_failed
+        self.failure_log = failure_log
         self.calls = []
         self.events = []
         self.active_devices = set()
@@ -74,6 +75,9 @@ class FakeConda:
         if action == "train" and self.training_delay:
             time.sleep(self.training_delay)
         failed = self.fail is not None and self.fail(action, config)
+        if failed and stdout is not None and self.failure_log is not None:
+            stdout.write(self.failure_log)
+            stdout.flush()
         omitted = self.omit_receipt is not None and self.omit_receipt(action, config)
         if not failed and not omitted:
             payload = {"action": action}
@@ -198,6 +202,53 @@ class FoundationWorkflowTests(unittest.TestCase):
         self.assertTrue(any(job["status"] == "failed" for job in manifest["jobs"]))
         self.assertTrue(any("Synthetic subprocess: smoke cxformer" in path.read_text()
                             for path in suite_dir.rglob("*.log")))
+
+    def test_failed_smoke_prints_last_log_lines_and_preserves_the_full_log(self):
+        failure_log = "".join(f"Earlier diagnostic line {index}\n" for index in range(30))
+        failure_log += ("Traceback (most recent call last):\n"
+                        "  File \"synthetic_encoder.py\", line 19, in load\n"
+                        "ImportError: synthetic encoder dependency is unavailable\n")
+        runner = FakeConda(self.root, fail=lambda action, config:
+                           action == "smoke" and config["model"] == "cxformer",
+                           failure_log=failure_log)
+        output = io.StringIO()
+        with redirect_stdout(output), patch.object(
+            self.workflow.subprocess, "run", side_effect=runner
+        ):
+            suite = self.workflow.run_suite(self.plan())
+        console = output.getvalue()
+        self.assertIn("[Last log lines] job-2  model=cxformer  mode=lora  action=smoke", console)
+        self.assertIn("Traceback (most recent call last):", console)
+        self.assertIn("ImportError: synthetic encoder dependency is unavailable", console)
+        self.assertNotIn("Earlier diagnostic line 0\n", console)
+        self.assertEqual(console.count("Earlier diagnostic line"), 9)
+        full_log = (suite / "logs" / "job-2_smoke.log").read_text()
+        self.assertIn("Earlier diagnostic line 0\n", full_log)
+        self.assertIn("ImportError: synthetic encoder dependency is unavailable", full_log)
+        manifest = json.loads((suite / "suite.json").read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["jobs"][2]["smoke_status"], "failed")
+        self.assertNotIn("train", [call[0] for call in runner.calls])
+
+    def test_unreadable_failure_log_does_not_mask_the_process_error(self):
+        runner = FakeConda(self.root, fail=lambda action, config: action == "prepare")
+        output = io.StringIO()
+        original_open = Path.open
+
+        def open_except_failed_log(path, *args, **kwargs):
+            if path.name == "job-0_prepare.log" and kwargs.get("errors") == "replace":
+                raise OSError("synthetic log read failure")
+            return original_open(path, *args, **kwargs)
+
+        with redirect_stdout(output), patch.object(
+            self.workflow.subprocess, "run", side_effect=runner
+        ), patch.object(Path, "open", open_except_failed_log):
+            suite = self.workflow.run_suite(self.plan())
+        manifest = json.loads((suite / "suite.json").read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertIn("Process exited 17", manifest["jobs"][0]["error"])
+        self.assertIn("Log unavailable: synthetic log read failure", output.getvalue())
+        self.assertEqual([call[0] for call in runner.calls], ["prepare"])
 
     def test_success_exit_without_receipt_does_not_pass_smoke(self):
         runner = FakeConda(self.root, omit_receipt=lambda action, config:

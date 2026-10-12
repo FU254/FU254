@@ -220,6 +220,8 @@ def _checkpoint_bytes(value, encoding="latin1", errors="strict"):
 def _numeric_checkpoint_globals():
     allowed = {
         "collections.OrderedDict": OrderedDict,
+        "__builtin__.set": set,
+        "builtins.set": set,
         "numpy.dtype": _numeric_dtype,
         "numpy.core.multiarray.scalar": _numeric_scalar,
         "numpy._core.multiarray.scalar": _numeric_scalar,
@@ -239,11 +241,13 @@ def _numeric_checkpoint_globals():
 
 
 class _NumericCheckpointUnpickler(pickle._Unpickler):
-    """Local tensor/numeric-metadata loader for PyTorch versions without safe_globals.
+    """Local tensor/numeric/set metadata loader for older PyTorch checkpoints.
 
     Besides an exact GLOBAL allowlist, restrict REDUCE, BUILD and storage IDs.
     In particular, never permit NumPy arrays, nested pickle/storage loaders, or
     extension opcodes that could bypass find_class through pickle's global cache.
+    CPython's ordinary FRAME support also handles protocol-4 checkpoints that
+    PyTorch's weights-only loader cannot parse, under these same restrictions.
     """
 
     dispatch = pickle._Unpickler.dispatch.copy()
@@ -320,13 +324,16 @@ def load_checkpoint(path, state_key=None):
     try:
         state = torch.load(path, map_location="cpu", weights_only=True)
     except pickle.UnpicklingError as error:
-        # Official older training checkpoints also save numerical metrics as
-        # numpy.float64 outside the tensor state dict. PyTorch 2.0 has no local
-        # safe_globals context; handle just that known restriction, never a
-        # generic deserialization failure or an unknown application class.
+        # Older training checkpoints save NumPy metrics and ordinary set
+        # metadata outside the tensor state dict. PyTorch 2.0 has no local
+        # safe_globals context. Its weights-only loader also lacks protocol-4
+        # FRAME (149) support; handle only these known restrictions, never an
+        # arbitrary unknown application class or corrupt checkpoint.
         message = str(error)
-        numeric_globals = ("numpy.core.multiarray.scalar", "numpy._core.multiarray.scalar", "numpy.dtype")
-        if not any(name in message for name in numeric_globals):
+        metadata_globals = ("numpy.core.multiarray.scalar", "numpy._core.multiarray.scalar", "numpy.dtype",
+                            "__builtin__.set", "builtins.set")
+        unsupported_frame = "Unsupported operand 149" in message
+        if not any(name in message for name in metadata_globals) and not unsupported_frame:
             raise
         state = _load_numeric_checkpoint(path)
     if state_key:

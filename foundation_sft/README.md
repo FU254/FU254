@@ -129,7 +129,7 @@ python run_foundation_experiments.py --seeds 42 43 44
 | `report/patient_roc_<模式>.png`、`patient_pr_<模式>.png` | 同模式所有指定实验的患者 ROC/PR 对比图 |
 | `report/excluded_jobs.csv`、`README.md`、`protocols.json` | 未完成项和原因、中文说明、权重/预处理/训练规范 |
 
-终端仅打印各阶段状态，训练每轮进展写入日志。用实际打印的路径查看，例如 `tail -f <suite目录>/logs/chexfound_lora_seed42_train.log`。单模型训练目录还保存独立的 ROC/PR/校准图和 `history.json`。
+终端打印各阶段状态；失败时会附上对应日志最后 12 行，显示具体异常。训练每轮进展写入日志。用实际打印的路径查看，例如 `tail -f <suite目录>/logs/chexfound_lora_seed42_train.log`。单模型训练目录还保存独立的 ROC/PR/校准图和 `history.json`。
 
 已有实验不必重训。将其**事先确定的**完整运行目录显式列出，即可单独汇总；程序会核对共同划分和相同测试患者/标签，不会自动寻找最高测试分。输出目录必须是新目录。
 
@@ -210,6 +210,14 @@ python run_foundation_experiments.py
 
 重新检查会生成新 suite，不会覆盖旧失败记录或改动患者划分。仍有错误时查看新 suite 的对应 `logs/`，按实际异常处理。
 
+后续服务器检查中，RAD-DINO、CXformer、CheXFound 的两种方式均已通过；EVA-X 在 NumPy 兼容路径中进一步遇到 `__builtin__.set`。加载代码现已补充普通 set 和协议 2/3/4 支持；未知应用类仍拒绝。RadJEPA 已加载权重并完成前后向，重载后 GPU 预测相差约 `4.47e-8`，被旧的零容差输出检查误判。更新 `models/common.py`、`train.py` 及 `workflow.py` 后，可先检查剩余两个模型，新版入口会直接显示失败日志的末尾异常：
+
+```bash
+python run_foundation_experiments.py --models eva_x radjepa --check-only
+```
+
+重载验证先严格比较保存前后每个可训练参数的键、形状、dtype 和数值，再比较有限的预测值。CPU 保留零容差；CUDA FP32 输出使用 `rtol=1e-5`、`atol=1e-6`，并在 `reload_check` 中记录实际最大绝对误差和使用的容差。参数不一致、非有限输出或超出容差的预测仍会失败，不改变模型计算或训练设置。全部检查通过后再运行默认 10 组完整实验。
+
 ## 数据和实验约定
 
 - Excel 的“放射编号”与 DICOM 的 `AccessionNumber` 匹配，“阻塞性通气障碍”必须为 0 或 1。未匹配到 Excel 的影像跳过，避免沿用上一张影像的标签。
@@ -252,11 +260,13 @@ python -m foundation_sft.train --config foundation_sft/configs/eva_x.json --acti
 
 ## 已完成的验证
 
-云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 99 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。新增覆盖统一流程的检查屏障、同卡排队与跨卡并行、子进程失败和成功回执、完整测试产物核对，以及比较报告的共同测试患者/标签校验、置信区间和跨种子统计。
+云端 Python 3.12 / PyTorch 2.9.1 CPU 环境通过 113 项 unittest：患者匹配和不可变分组、真实小型 HF 编码器的 LP/LoRA、训练到重载评估、继续训练与连续训练一致、不等微批次的梯度累积、各模型特征和注意力目标、患者 bootstrap、EVA 注意力回退、带非对称窗口的 DICOM 灰阶方向，以及实际 CXformer 预处理与 OpenCV＋BiT 的对照、RadJEPA 本地 `.pth.tar` 严格加载和联网方法不会被调用。新增覆盖统一流程的检查屏障、同卡排队与跨卡并行、子进程失败和成功回执、完整测试产物核对，以及比较报告的共同测试患者/标签校验、置信区间和跨种子统计。
 
-为修复真实服务器日志中的兼容错误，还在独立 Python 3.10.22 / Torch 2.0.1+cpu / torchvision 0.15.2+cpu / timm 0.4.12 / Transformers 4.48.3 环境通过相同的全部 99 项测试，无跳过。11 项新增测试覆盖真实 Tensor + NumPy 标量 checkpoint 加载，以及不支持的对象、嵌套加载和扩展 opcode 拒绝；不会修改 Torch 全局。完整 CXformer-small 也以合成权重完成本地严格加载、LoRA 反向和冻结检查。医学预训练文件和 A6000 内核仍须在服务器验证。
+为修复真实服务器日志中的兼容错误，还在独立 Python 3.10.22 / Torch 2.0.1+cpu / torchvision 0.15.2+cpu / timm 0.4.12 / Transformers 4.48.3 环境通过相同的全部 113 项测试，无跳过。15 项 checkpoint 测试覆盖真实 Tensor + NumPy 标量 + set 元数据、协议 2/3/4 加载，以及不支持的对象、嵌套加载和扩展 opcode 拒绝；不会修改 Torch 全局。工作流还验证失败日志末尾异常可见及读取日志失败不改变原任务状态。完整 CXformer-small 也以合成权重完成本地严格加载、LoRA 反向和冻结检查。医学预训练文件和 A6000 内核仍须在服务器验证。
 
 统一流程还用合成 DICOM、真实小型 DINOv2 编码器和实际子进程，跑通 prepare → 两种模式 smoke → LP/LoRA 训练及自动测试 → 汇总 CSV 和 ROC/PR 图。测试中将 Conda 启动器替换为隔离 CPU Python 路由；这验证了软件流程，没有验证远端 Conda 环境或五个模型的医学权重。
+
+8 项重载校验测试覆盖近零 FP32 logits 的 `4.47e-8` 差异允许通过、显著偏差及 NaN/Inf 拒绝、可训练参数微小漂移和键/形状/dtype 不一致拒绝，以及 CPU 输出仍采用零容差。
 
 另外，RayDINO 官方 `xray_dino_vitl16` 完整 ViT-L/16 架构已用随机初始化和小尺寸合成输入完成 24 层 LoRA 前向、反向、冻结参数及重载一致性检查。这些检查不代表已加载医学预训练权重，也不代表已经在你的 SSH 服务器完成训练。
 

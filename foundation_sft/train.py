@@ -314,6 +314,41 @@ def run_training(config, adapter=None, resume=None):
     return run
 
 
+def _verify_smoke_reload(model, expected_state, before, after, device):
+    """Require exact saved parameters and numerically stable repeated inference.
+
+    CUDA reductions can differ in their final floating-point bits between
+    otherwise identical evaluation calls. Parameter restoration remains exact;
+    only repeated GPU logits receive a small, explicit dtype-specific tolerance.
+    """
+    restored_state = model.trainable_state_dict()
+    if set(restored_state) != set(expected_state):
+        raise AssertionError("Reloaded trainable parameter keys differ from the saved state")
+    for name, expected in expected_state.items():
+        restored = restored_state[name]
+        if restored.dtype != expected.dtype or restored.shape != expected.shape:
+            raise AssertionError(f"Reloaded parameter dtype or shape differs: {name}")
+        torch.testing.assert_close(expected, restored, rtol=0, atol=0,
+                                   msg=f"Reloaded trainable parameter differs: {name}")
+    if not torch.isfinite(before).all().item() or not torch.isfinite(after).all().item():
+        raise AssertionError("Reload inference produced non-finite logits")
+    rtol, atol = 0.0, 0.0
+    if torch.device(device).type == "cuda":
+        tolerances = {
+            torch.float64: (1e-7, 1e-9),
+            torch.float32: (1e-5, 1e-6),
+            torch.float16: (1e-3, 1e-4),
+            torch.bfloat16: (1e-2, 1e-3),
+        }
+        if before.dtype not in tolerances:
+            raise AssertionError(f"Unsupported reload logits dtype: {before.dtype}")
+        rtol, atol = tolerances[before.dtype]
+    torch.testing.assert_close(before, after, rtol=rtol, atol=atol)
+    difference = (before.detach().double() - after.detach().double()).abs()
+    return {"trainable_state_exact": True, "rtol": rtol, "atol": atol,
+            "max_abs_diff": difference.max().item() if difference.numel() else 0.0}
+
+
 def smoke(config):
     set_seed(config["seed"])
     split = prepare(config)
@@ -336,20 +371,24 @@ def smoke(config):
     model.eval()
     with torch.no_grad():
         before = model(batch["image"].to(device)).clone()
-    state = model.trainable_state_dict()
+    # CPU state_dict values can share storage with the live parameters. Clone
+    # before saving so a reload cannot silently change the reference snapshot.
+    state = {name: value.detach().cpu().clone()
+             for name, value in model.trainable_state_dict().items()}
     with tempfile.TemporaryDirectory() as temporary:
         file = Path(temporary) / "adapter.pt"
         torch.save(state, file)
         model.load_trainable_state_dict(torch.load(file, map_location="cpu", weights_only=True))
     with torch.no_grad():
         after = model(batch["image"].to(device))
-    torch.testing.assert_close(before, after, rtol=0, atol=0)
+    reload_check = _verify_smoke_reload(model, state, before, after, device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     report = {**model.training_metadata(), "logits_shape": list(features["logits"].shape),
               "global_shape": list(features["global_features"].shape),
               "local_shape": list(features["local_features"].shape),
-              "grid_shape": list(features["grid_shape"]), "smoke_passed": True}
+              "grid_shape": list(features["grid_shape"]), "reload_check": reload_check,
+              "smoke_passed": True}
     print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     return report
 

@@ -9,7 +9,7 @@
 - 架构 ViT-B/16，224 输入，12 层、768 通道、独立 Q/K/V；LoRA 注入 36 个投影。
 - 在 `configs/eva_x.json` 填本地 `checkpoint`；分类预训练头可以忽略，编码器参数必须完整匹配。
 - 保留已修正的原生注意力回退，不需要因安装 xformers 而回滚。
-- 旧官方 checkpoint 可能同时保存 NumPy 数值标量元数据。加载器先使用 Torch 的 `weights_only=True`；遇到这种受限类型时，以局部受限加载方式兼容数值元数据，仍只返回编码器张量，不需要改写权重文件。
+- 旧官方 checkpoint 可能同时保存 NumPy 数值标量和普通 Python `set` 元数据。加载器先使用 Torch 的 `weights_only=True`；遇到这些已知类型或协议 4 FRAME 限制时，以同一个局部受限加载方式兼容，仍只返回编码器张量，不需要改写权重文件。
 
 ## RAD-DINO
 
