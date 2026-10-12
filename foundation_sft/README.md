@@ -1,5 +1,7 @@
 # 六个胸片基础模型的监督训练
 
+当前进度、服务器路径和下一步操作见 [项目交接文档](PROJECT_HANDOFF.md)。
+
 提供 EVA-X、RAD-DINO、RayDINO、CheXFound、CXformer 和 RadJEPA 的统一入口。每个模型均支持真正的线性探测（`linear_probe`）以及注意力 LoRA 加分类头（`lora`），用于预测 Excel 中的“阻塞性通气障碍”。代码可以在本地 PyCharm 编辑，通过 SSH 解释器使用服务器的数据、权重和 GPU。
 
 原 `LoRA-分类/base-1.py` 保留。新框架独立放在本目录，各模型通过适配器保留自己的输入尺寸、归一化和注意力结构。
