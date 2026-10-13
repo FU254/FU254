@@ -1,4 +1,4 @@
-"""Local visual-only adapters for the released XraySigLIP and BiomedCLIP.
+"""Local visual-only adapter for the released OpenCLIP-format BiomedCLIP.
 
 Constructing OpenCLIP's complete model would also construct/download a text
 encoder for BiomedCLIP. This module builds only its TimmModel visual tower and
@@ -21,15 +21,6 @@ from .common import (BackboneAdapter, BackboneFeatures, PreprocessSpec,
 
 
 RELEASES = {
-    "xray_siglip": {
-        "source": "StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli",
-        "image_size": 512,
-        "embed_dim": 768,
-        "timm_model_name": "vit_base_patch16_siglip_512",
-        "timm_pool": "map",
-        "timm_proj": "none",
-        "prefix_tokens": 0,
-    },
     "biomedclip": {
         "source": "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
         "image_size": 224,
@@ -76,7 +67,7 @@ def _square_size(value):
 def _release_config(config, payload):
     model_name = config.get("model")
     if model_name not in RELEASES:
-        raise ValueError("OpenCLIP adapter model must be xray_siglip or biomedclip")
+        raise ValueError("OpenCLIP adapter model must be biomedclip; XraySigLIP uses its native HF adapter")
     release = RELEASES[model_name]
     source = config.get("checkpoint_source") or release["source"]
     if source != release["source"]:
@@ -102,7 +93,7 @@ def _release_config(config, payload):
     expected = {key: release[key] for key in ("timm_model_name", "timm_proj")}
     differences = {key: (vision.get(key), wanted) for key, wanted in expected.items()
                    if vision.get(key) != wanted}
-    allowed_pool = {"", "token"} if model_name == "biomedclip" else {"map"}
+    allowed_pool = {"", "token"}
     if not isinstance(vision["timm_pool"], str) or vision["timm_pool"] not in allowed_pool:
         differences["timm_pool"] = (vision["timm_pool"], sorted(allowed_pool))
     if _square_size(vision.get("image_size")) != release["image_size"]:
@@ -271,11 +262,12 @@ class OpenCLIPVisionAdapter(BackboneAdapter):
         self.feature_dim = embed_dim
         self.prefix_tokens = prefix_tokens
         self.normalize = normalize
+        if prefix_tokens != 1:
+            raise ValueError("BiomedCLIP requires its released single CLS prefix token")
         actual_prefix = getattr(visual.trunk, "num_prefix_tokens", None)
         if actual_prefix != prefix_tokens:
             raise ValueError("OpenCLIP visual prefix tokens differ from the verified release")
-        expected_pool = "map" if prefix_tokens == 0 else "token"
-        if getattr(visual.trunk, "global_pool", None) != expected_pool:
+        if getattr(visual.trunk, "global_pool", None) != "token":
             raise ValueError("OpenCLIP native visual pooling differs from the verified release")
         patch = visual.trunk.patch_embed.patch_size
         self.patch_size = (patch, patch) if isinstance(patch, int) else tuple(patch)
@@ -317,6 +309,8 @@ class OpenCLIPVisionAdapter(BackboneAdapter):
 
 
 def build_openclip_vlm(config):
+    if config.get("model") not in RELEASES:
+        raise ValueError("OpenCLIP adapter model must be biomedclip; XraySigLIP uses its native HF adapter")
     if not config.get("model_dir"):
         raise ValueError("OpenCLIP medical models require a complete local model_dir snapshot")
     directory = Path(config["model_dir"]).expanduser().resolve()
@@ -361,7 +355,7 @@ def build_openclip_vlm(config):
         "embedding_normalization": "l2_global_and_local" if normalize else "none",
         "global_features": "released visual pooling and projection",
         "local_features": "spatial patch tokens with the same retained visual linear projection; no CLS",
-        "lora_attention_scope": "visual transformer block fused QKV; attention pooling and projection remain frozen",
+        "lora_attention_scope": "visual transformer block fused QKV; released image projection remains frozen",
         "text_tower_constructed": False, "library_versions": versions, **loading,
         "checkpoint_identity_note": "Source ID declares the official medical release; local SHA-256 identifies "
                                     "the artifact. Do not substitute generic timm/OpenAI pretrained weights.",

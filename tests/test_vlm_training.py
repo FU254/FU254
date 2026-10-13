@@ -83,17 +83,38 @@ class VLMTrainingTests(unittest.TestCase):
             # Override geometry explicitly for this tiny software-only test.
             adapter.preprocess = replace(adapter.preprocess, image_size=32, resize_mode="resize")
             return adapter
+        if model_name == "xray_siglip":
+            from transformers import SiglipVisionConfig, SiglipVisionModel
+            from foundation_sft.models.hf_siglip import HFSiglipAdapter
+
+            encoder = SiglipVisionModel(SiglipVisionConfig(
+                image_size=32, patch_size=8, hidden_size=12, intermediate_size=24,
+                num_hidden_layers=2, num_attention_heads=3,
+            ))
+            preprocess = PreprocessSpec(32, mean=(0.5,) * 3, std=(0.5,) * 3,
+                                        resize_mode="resize", interpolation="bicubic")
+            adapter = HFSiglipAdapter(encoder, preprocess, provenance, normalize=False)
+            images = torch.randn(2, 3, 32, 32)
+            encoder.eval()
+            adapter.eval()
+            with torch.no_grad():
+                expected = encoder(pixel_values=images)
+                features = adapter.forward_features(images).validate()
+            torch.testing.assert_close(features.global_features, expected.pooler_output, rtol=0, atol=0)
+            torch.testing.assert_close(features.local_features, expected.last_hidden_state, rtol=0, atol=0)
+            self.assertEqual(features.grid_shape, (4, 4))
+            return adapter
         from open_clip.timm_model import TimmModel
         from timm.models.vision_transformer import VisionTransformer
 
-        is_biomedclip = model_name == "biomedclip"
+        self.assertEqual(model_name, "biomedclip")
         release = openclip_vlm.RELEASES[model_name]
         trunk = VisionTransformer(
             img_size=32, patch_size=8, embed_dim=12, depth=2, num_heads=3, num_classes=0,
-            class_token=is_biomedclip, global_pool=release["timm_pool"],
+            class_token=True, global_pool=release["timm_pool"],
         )
         trunk.default_cfg = {"pool_size": None}
-        output_dim = 8 if is_biomedclip else 12
+        output_dim = 8
         vision = {"timm_model_name": "synthetic-local-tiny-vit", "image_size": 32,
                   "timm_pool": release["timm_pool"], "timm_proj": release["timm_proj"],
                   "timm_model_pretrained": False}
@@ -104,16 +125,10 @@ class VLMTrainingTests(unittest.TestCase):
         self.assertIsInstance(visual, TimmModel)
         self.assertFalse(factory.call_args.kwargs["pretrained"])
         self.assertEqual(visual.trunk.global_pool, release["timm_pool"])
-        if is_biomedclip:
-            self.assertIsNotNone(visual.trunk.cls_token)
-            self.assertIsInstance(visual.head.proj, nn.Linear)
-        else:
-            self.assertIsNone(visual.trunk.cls_token)
-            self.assertIsNotNone(visual.trunk.attn_pool)
-            self.assertEqual(len(visual.head), 0)
+        self.assertIsNotNone(visual.trunk.cls_token)
+        self.assertIsInstance(visual.head.proj, nn.Linear)
         preprocess = PreprocessSpec(32, mean=(0.2, 0.3, 0.4), std=(0.5, 0.6, 0.7),
-                                    resize_mode="shortest_edge_center_crop" if is_biomedclip else "resize",
-                                    resize_shortest_edge=32 if is_biomedclip else None)
+                                    resize_mode="shortest_edge_center_crop", resize_shortest_edge=32)
         adapter = openclip_vlm.OpenCLIPVisionAdapter(
             visual, preprocess, provenance, embed_dim=output_dim,
             prefix_tokens=release["prefix_tokens"], normalize=False,

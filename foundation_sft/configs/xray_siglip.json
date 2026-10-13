@@ -2,7 +2,7 @@
   "base_config": "common_vlm.json",
   "model": "xray_siglip",
   "model_dir": "foundation_weights/xray_siglip",
-  "checkpoint": "open_clip_pytorch_model.bin",
+  "checkpoint": "model.safetensors",
   "checkpoint_source": "StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli",
   "normalize_image_embedding": false,
   "training": {

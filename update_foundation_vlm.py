@@ -28,9 +28,10 @@ FILES = {
     },
     "foundation_sft/models/__init__.py": {
         "previous": [
-            "92039b30fb2f2a68d617656f62a28ee179eed027a384edc2ea4fbbebae9cd48a"
+            "92039b30fb2f2a68d617656f62a28ee179eed027a384edc2ea4fbbebae9cd48a",
+            "7a4ee990697a1ca79eb7b1b7dcd7fced971092cec72b00b48d21a9cee45e9034"
         ],
-        "updated": "7a4ee990697a1ca79eb7b1b7dcd7fced971092cec72b00b48d21a9cee45e9034"
+        "updated": "c7bdc7014861514bdbdaf41b6711007668511f902b380730ae81da47e5e40d29"
     },
     "foundation_sft/models/common.py": {
         "previous": [
@@ -59,9 +60,10 @@ FILES = {
     },
     "foundation_sft/models/openclip_vlm.py": {
         "previous": [
-            None
+            None,
+            "df0b5519182318c39c8e8ba2dff778013060f77b1f3ca4cff5742caf6125fca6"
         ],
-        "updated": "df0b5519182318c39c8e8ba2dff778013060f77b1f3ca4cff5742caf6125fca6"
+        "updated": "782595f3e5e0c9c642e1fd11c181a3a43a2de363bad6f04126af5346640a8295"
     },
     "foundation_sft/models/chexzero.py": {
         "previous": [
@@ -95,9 +97,10 @@ FILES = {
     },
     "foundation_sft/configs/xray_siglip.json": {
         "previous": [
-            None
+            None,
+            "99fbf5424c107728c505e380890dd10ebbc078eb2c572e64f6b6d087d1b67bfc"
         ],
-        "updated": "99fbf5424c107728c505e380890dd10ebbc078eb2c572e64f6b6d087d1b67bfc"
+        "updated": "eee4d554f8c3e2d003b95e5bfd14c1cf10022c48042382e0327c5f1759090813"
     },
     "foundation_sft/configs/biomedclip.json": {
         "previous": [
@@ -120,11 +123,27 @@ FILES = {
     "foundation_sft/FOUNDATION_VLM_SETUP.md": {
         "previous": [
             None,
-            "84115fddbdf4905302b9a812690d665581072bf1a0483add4bfc2f4dcda0b512"
+            "84115fddbdf4905302b9a812690d665581072bf1a0483add4bfc2f4dcda0b512",
+            "54db128b625ed409b7ceee1c46534a389eb791dd9a81b149ea7f01ffabe39bbd"
         ],
-        "updated": "54db128b625ed409b7ceee1c46534a389eb791dd9a81b149ea7f01ffabe39bbd"
+        "updated": "bc8dc6cba4ffc5d541a08d6932dc86bb601a9279009c566214dc58f6bc3f8c1f"
+    },
+    "foundation_sft/models/hf_siglip.py": {
+        "previous": [
+            None
+        ],
+        "updated": "aa0fce599c4bf8917f66b17c0029ba0c54360877ddbb9873fa286eda810cfbc3"
     }
 }
+
+
+XRAY_UPDATE_FILES = (
+    "foundation_sft/models/__init__.py",
+    "foundation_sft/models/hf_siglip.py",
+    "foundation_sft/models/openclip_vlm.py",
+    "foundation_sft/configs/xray_siglip.json",
+    "foundation_sft/FOUNDATION_VLM_SETUP.md",
+)
 
 
 def _digest(data):
@@ -163,7 +182,7 @@ def _atomic_write(path, data, mode):
         _unlink_if_present(temporary)
 
 
-def install(project, source_dir, *, apply=False):
+def install(project, source_dir, *, apply=False, xray_siglip_only=False):
     if sys.version_info < (3, 10):
         raise ValueError("Python 3.10 or newer is required. Run conda activate evax_lora "
                          "before this installer; no installation lock was created.")
@@ -175,12 +194,13 @@ def install(project, source_dir, *, apply=False):
         raise ValueError("--project must point to the existing EVA-X project")
     if not FILES:
         raise ValueError("This installer has no reviewed payload manifest")
+    selected = {name: FILES[name] for name in XRAY_UPDATE_FILES} if xray_siglip_only else FILES
     lock = project / ".foundation-vlm-update.lock"
     descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     os.close(descriptor)
     try:
         pending, originals, modes = {}, {}, {}
-        for relative, fingerprints in FILES.items():
+        for relative, fingerprints in selected.items():
             payload_path = _path(source, relative)
             if not payload_path.is_file() or payload_path.stat().st_size > 1024 * 1024:
                 raise ValueError(f"Missing or oversized uploaded payload: {relative}")
@@ -252,9 +272,11 @@ def main(argv=None):
     parser.add_argument("--project", default=".")
     parser.add_argument("--source-dir", required=True, help="Uploaded extracted ZIP root containing foundation_sft/")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--xray-siglip-only", action="store_true",
+                        help="Only install the native XraySigLIP adapter, routing, config and setup notes")
     args = parser.parse_args(argv)
     try:
-        install(args.project, args.source_dir, apply=args.apply)
+        install(args.project, args.source_dir, apply=args.apply, xray_siglip_only=args.xray_siglip_only)
     except (OSError, ValueError, SyntaxError) as error:
         parser.exit(1, f"Four-model update failed: {error}\n")
 

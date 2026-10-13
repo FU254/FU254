@@ -27,7 +27,10 @@ def build_adapter(config):
     if name == "cxr_clip":
         from .cxr_clip import build_cxr_clip
         return build_cxr_clip(config)
-    if name in {"xray_siglip", "biomedclip"}:
+    if name == "xray_siglip":
+        from .hf_siglip import build_hf_siglip
+        return build_hf_siglip(config)
+    if name == "biomedclip":
         from .openclip_vlm import build_openclip_vlm
         return build_openclip_vlm(config)
     if name == "chexzero":

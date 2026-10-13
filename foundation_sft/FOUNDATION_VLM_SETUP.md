@@ -37,7 +37,21 @@ py -m venv D:\99\hf_download
 - [StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli](https://huggingface.co/StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli)
 - [microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224](https://huggingface.co/microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224)
 
-保留各目录中的官方 `open_clip_config.json`，包括模型结构和预处理配置。默认配置明确选用 `open_clip_pytorch_model.bin`；目录存在其他权重格式时不会自动改选。若官方目录只有 `model.safetensors`，将对应模型 JSON 的 `checkpoint` 改为这个文件名；不要改动官方结构配置。checkpoint 文件名相对于 `model_dir`，两个目录不能交叉使用。
+两个 Hugging Face 发布使用不同格式，不能共用加载代码或结构配置：
+
+- **XraySigLIP 是原生 Transformers SigLIP**：保留同一官方目录的 `model.safetensors`、`config.json` 和 `preprocessor_config.json`。默认 checkpoint 为 `model.safetensors`，实际权重键是 `vision_model.*`、`text_model.*`，不需要 `open_clip_config.json`。只加载视觉权重，保留原生注意力池化。
+- **BiomedCLIP 是 OpenCLIP**：保留官方 `open_clip_config.json` 和 `open_clip_pytorch_model.bin`。如果实际发布的权重为 `model.safetensors`，显式修改 `biomedclip.json` 的 `checkpoint`；不会自动改选另一份权重。
+
+checkpoint 文件名相对于 `model_dir`，两个目录不能交叉使用。不能用其他模型的配置、随机模型或补造 JSON 代替官方文件。
+
+若已经下载 XraySigLIP 权重、只缺 `config.json`，在 **Windows PowerShell** 只补下载这一小文件，不必重新下载权重：
+
+```powershell
+& 'D:\99\hf_download\Scripts\huggingface-cli.exe' download StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli config.json --local-dir 'D:\99\EVA-X-main\foundation_weights\xray_siglip' --local-dir-use-symlinks False
+scp 'D:\99\EVA-X-main\foundation_weights\xray_siglip\config.json' 'cfu@192.168.130.16:/home/cfu/EVA-X-main/foundation_weights/xray_siglip/'
+```
+
+也可用浏览器打开[同一模型的官方 config.json](https://huggingface.co/StanfordAIMI/XraySigLIP__vit-b-16-siglip-512__webli/resolve/main/config.json?download=true)，保存到上述目录。若官方文件访问失败，保留错误信息；不要把 `preprocessor_config.json` 重命名为 `config.json`。
 
 CXR-CLIP 下载官方 Swin-Tiny MCC 权重：
 
@@ -63,7 +77,7 @@ best_64_0.0001_original_17000_0.863.pt
 ```powershell
 Get-FileHash -Algorithm SHA256 'D:\99\EVA-X-main\foundation_weights\cxr_clip\swint_mcc.tar'
 Get-FileHash -Algorithm SHA256 'D:\99\EVA-X-main\foundation_weights\chexzero\best_64_0.0001_original_17000_0.863.pt'
-Get-FileHash -Algorithm SHA256 'D:\99\EVA-X-main\foundation_weights\xray_siglip\open_clip_pytorch_model.bin'
+Get-FileHash -Algorithm SHA256 'D:\99\EVA-X-main\foundation_weights\xray_siglip\model.safetensors'
 Get-FileHash -Algorithm SHA256 'D:\99\EVA-X-main\foundation_weights\biomedclip\open_clip_pytorch_model.bin'
 ```
 
@@ -89,6 +103,13 @@ python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update -
 
 更新器核对固定源码校验值与已知旧版本，只更新本次运行所需的适配器、公共运行模块、新配置、依赖文件和本文；已有代码有未识别修改时会停止，检查失败不会覆盖任何代码。旧代码保存在 `runs/foundation_sft_vlm/code_backups/`。`configs/common.json`、原 `configs/experiments.json`、数据、权重和已有实验结果均不改动。更新器本身不安装依赖、不联网、不训练。
 
+如果已经安装四模型代码，本次只修正 XraySigLIP，使用 `--xray-siglip-only`。它只检查并安装 5 个相关文件，自动备份；不会读取或改写其他模型的配置、训练器及数据模块，保留正在运行的其他实验：
+
+```bash
+/opt/anaconda3/envs/evax_lora/bin/python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update --xray-siglip-only
+/opt/anaconda3/envs/evax_lora/bin/python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update --xray-siglip-only --apply
+```
+
 如果曾使用旧 `base` Python 运行旧版更新器，可能出现 `:=` 的 SyntaxError，以及 `unlink(missing_ok=True)` 的 TypeError。此错误发生在写入前的校验阶段。确认上一条更新命令已经退出后，在项目根目录用已激活的 `evax_lora` 清理残留锁，再重新检查：
 
 ```bash
@@ -105,6 +126,7 @@ python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update
   foundation_sft/
     models/cxr_clip.py
     models/openclip_vlm.py
+    models/hf_siglip.py
     models/chexzero.py
     training_history.py
     configs/common_vlm.json
@@ -116,8 +138,9 @@ python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update
     requirements-openclip.txt
   foundation_weights/
     cxr_clip/swint_mcc.tar
-    xray_siglip/open_clip_config.json
-    xray_siglip/open_clip_pytorch_model.bin
+    xray_siglip/config.json
+    xray_siglip/preprocessor_config.json
+    xray_siglip/model.safetensors
     biomedclip/open_clip_config.json
     biomedclip/open_clip_pytorch_model.bin
     chexzero/best_64_0.0001_original_17000_0.863.pt
@@ -131,13 +154,13 @@ python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update
 cd /home/cfu/EVA-X-main
 sha256sum foundation_weights/cxr_clip/swint_mcc.tar \
   foundation_weights/chexzero/best_64_0.0001_original_17000_0.863.pt \
-  foundation_weights/xray_siglip/open_clip_pytorch_model.bin \
+  foundation_weights/xray_siglip/model.safetensors \
   foundation_weights/biomedclip/open_clip_pytorch_model.bin
 ```
 
 ## 3. 在服务器创建 OpenCLIP 环境
 
-CXR-CLIP 和 CheXzero 沿用已工作的 `evax_lora`。两个 OpenCLIP 模型要求较新的 timm，另建克隆环境，避免影响 EVA-X 的 timm：
+CXR-CLIP 和 CheXzero 沿用已工作的 `evax_lora`。BiomedCLIP 要求较新的 OpenCLIP/timm，另建克隆环境，避免影响 EVA-X 的 timm。XraySigLIP 使用已安装的 `transformers==4.48.3`，仍沿用既有 `cxr_openclip` 任务环境分配：
 
 ```bash
 cd /home/cfu/EVA-X-main
@@ -198,7 +221,8 @@ python run_foundation_experiments.py \
 所有模型从同一份 DICOM 解码、窗宽窗位和灰阶方向处理出发，再执行对应尺寸、几何变换及归一化。共享 float32 DICOM 缩放与官方先生成 uint8/PIL RGB 的流程存在量化和插值差别，**不能宣称像素级复现官方 RGB 输入**；这一差别会保存在模型预处理记录中。模型间可比较的是本研究明确的共享 DICOM 分类流程。
 
 - CXR-CLIP 保留官方 Swin-Tiny 224 输入、短边缩放后中心裁剪及 0.5/0.5 归一化。Swin 没有 CLS token，官方全局特征选最终空间序列的第一个 token，本适配器保留此行为。
-- XraySigLIP 使用官方 512 视觉塔、发布的注意力池化；BiomedCLIP 使用官方 224 视觉塔与 512 维视觉投影。预处理遵循固定 OpenCLIP 2.23.0 的官方加载规则：先取该版本 `PreprocessCfg` 默认值，再合并本地官方 `preprocess_cfg`；发布字段优先。继承了哪些默认字段及库版本会保存，不在模型 JSON 中编造或覆写均值、标准差，也不改写下载的官方配置。
+- XraySigLIP 使用 Transformers 4.48.3 原生 SigLIP 512 视觉塔和发布的多头注意力池化。模型结构来自本地官方 `config.json` 的 `vision_config`，预处理来自 `preprocessor_config.json`；用户实际快照为 512×512 双三次缩放、0.5/0.5 归一化。仅加载 `vision_model.*`，既不构造文本塔，也不读取文本张量；LoRA 注入 12 层视觉自注意力的 36 个独立 Q/K/V 投影。兼容已有 PyTorch 2.0.1，使用原生 eager 注意力，不插值位置编码。
+- BiomedCLIP 使用官方 224 视觉塔与 512 维视觉投影。预处理遵循固定 OpenCLIP 2.23.0 的官方加载规则：先取该版本 `PreprocessCfg` 默认值，再合并本地官方 `preprocess_cfg`；发布字段优先。两模型继承的默认字段、库版本和官方 JSON SHA-256 均记录；不在模型配置中编造均值、标准差，不改写官方配置。
 - CheXzero 保留医学 CLIP ViT-B/32 的 224 编码器，以及官方医疗图像长边缩放、320 黑边填充、224 张量缩放与医学归一化路径；单个发布 checkpoint 的投影也被保留。
 
 局部特征用于本研究的监督分类扩展，不是作者发布的独立局部评分任务。BiomedCLIP 将空间 patch token 通过同一发布视觉投影；CheXzero 使用空间 patch token 经发布 `ln_post` 和视觉投影；XraySigLIP 提供视觉 patch 序列，CXR-CLIP 提供最终 Swin 空间序列。LoRA 注入各视觉块的 Q/K/V 投影，发布池化和视觉投影保持冻结；原始投影没有被新建随机层替换。全局及局部特征的定义、checkpoint SHA-256 和预处理记录保存在每个 run 的 `model_metadata.json`。

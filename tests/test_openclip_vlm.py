@@ -1,4 +1,4 @@
-"""Release-config checks and real tiny timm visual-only integration tests.
+"""BiomedCLIP release-config checks and real tiny timm integration tests.
 
 Fixtures are local, randomly initialized software tests, not medical weights.
 No complete text encoder, public model weights, or network is needed.
@@ -36,7 +36,7 @@ def _config_payload(model_name):
         },
         "preprocess_cfg": {
             "mean": [0.2, 0.3, 0.4], "std": [0.5, 0.6, 0.7],
-            "resize_mode": "squash" if model_name == "xray_siglip" else "shortest",
+            "resize_mode": "shortest",
             "interpolation": "bicubic",
         },
     }
@@ -44,7 +44,7 @@ def _config_payload(model_name):
 
 class OpenCLIPReleaseConfigTests(unittest.TestCase):
     @unittest.skipUnless(HAS_OPENCLIP, "Pinned OpenCLIP preprocessing defaults required")
-    def test_both_release_architectures_and_declared_preprocessing(self):
+    def test_biomedclip_release_architecture_and_declared_preprocessing(self):
         for name in vlm.RELEASES:
             with self.subTest(name=name):
                 payload = _config_payload(name)
@@ -56,8 +56,7 @@ class OpenCLIPReleaseConfigTests(unittest.TestCase):
                 self.assertEqual(record["shared_preprocess"], asdict(spec))
                 self.assertEqual(vision["timm_model_name"], release["timm_model_name"])
                 self.assertFalse(spec.do_hist_equalization)
-                self.assertEqual(spec.resize_mode, "resize" if name == "xray_siglip"
-                                 else "shortest_edge_center_crop")
+                self.assertEqual(spec.resize_mode, "shortest_edge_center_crop")
 
     @unittest.skipUnless(HAS_OPENCLIP, "Pinned OpenCLIP visual config defaults required")
     def test_generic_source_or_changed_visual_architecture_is_rejected(self):
@@ -133,17 +132,24 @@ class OpenCLIPReleaseConfigTests(unittest.TestCase):
                  {"resize_mode": "longest"}, {"interpolation": "random"},
                  {"size": 128}, {"mean": [0.0]}, {"std": [True, 1.0, 1.0]})
         for settings in cases:
-            payload = _config_payload("xray_siglip")
+            payload = _config_payload("biomedclip")
             payload["preprocess_cfg"].update(settings)
             with self.subTest(settings=settings), self.assertRaises(ValueError):
-                vlm._preprocess(payload, vlm.RELEASES["xray_siglip"], {})
+                vlm._preprocess(payload, vlm.RELEASES["biomedclip"], {})
 
     def test_missing_complete_published_preprocessor_is_rejected(self):
         for value in (None, [], "unknown"):
-            payload = _config_payload("xray_siglip")
+            payload = _config_payload("biomedclip")
             payload["preprocess_cfg"] = value
             with self.subTest(value=value), self.assertRaises(ValueError):
-                vlm._preprocess(payload, vlm.RELEASES["xray_siglip"], {})
+                vlm._preprocess(payload, vlm.RELEASES["biomedclip"], {})
+
+    def test_xray_siglip_cannot_use_the_openclip_builder(self):
+        config = {"model": "xray_siglip", "model_dir": "not-needed-for-native-HF-model"}
+        with self.assertRaisesRegex(ValueError, "native HF adapter"):
+            vlm._release_config(config, _config_payload("biomedclip"))
+        with self.assertRaisesRegex(ValueError, "native HF adapter"):
+            vlm.build_openclip_vlm(config)
 
     @unittest.skipUnless(HAS_OPENCLIP, "Pinned OpenCLIP visual config defaults required")
     def test_patch_dropout_and_unknown_model_options_are_rejected(self):
@@ -172,19 +178,20 @@ class OpenCLIPVisualIntegrationTests(unittest.TestCase):
     def _visual(self, model_name):
         from timm.models.vision_transformer import VisionTransformer
 
+        self.assertEqual(model_name, "biomedclip")
+
         class TinyVisual(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.trunk = VisionTransformer(
                     img_size=8, patch_size=4, embed_dim=12, depth=2,
                     num_heads=3, num_classes=0,
-                    class_token=model_name == "biomedclip",
-                    global_pool="token" if model_name == "biomedclip" else "map",
+                    class_token=True, global_pool="token",
                 )
                 self.trunk.default_cfg = {"pool_size": None}
                 self.head = nn.Sequential(OrderedDict([
                     ("drop", nn.Dropout(0.0)), ("proj", nn.Linear(12, 8, bias=False)),
-                ])) if model_name == "biomedclip" else nn.Sequential()
+                ]))
 
             def forward(self, images):
                 return self.head(self.trunk(images))
@@ -193,12 +200,12 @@ class OpenCLIPVisualIntegrationTests(unittest.TestCase):
         return TinyVisual()
 
     def _adapter(self, name, visual=None, normalize=False):
+        self.assertEqual(name, "biomedclip")
         return vlm.OpenCLIPVisionAdapter(
             self._visual(name) if visual is None else visual,
             PreprocessSpec(8, mean=(0.2, 0.3, 0.4), std=(0.5, 0.6, 0.7)),
             {"source": "synthetic software fixture"},
-            embed_dim=8 if name == "biomedclip" else 12,
-            prefix_tokens=1 if name == "biomedclip" else 0, normalize=normalize,
+            embed_dim=8, prefix_tokens=1, normalize=normalize,
         )
 
     def _checkpoint(self, visual, suffix=".bin", mutate=None):
@@ -224,8 +231,7 @@ class OpenCLIPVisualIntegrationTests(unittest.TestCase):
                 with torch.no_grad():
                     expected_global = visual(images)
                     tokens = visual.trunk.forward_features(images)
-                    local = tokens[:, 1:] if name == "biomedclip" else tokens
-                    expected_local = visual.head.proj(local) if name == "biomedclip" else local
+                    expected_local = visual.head.proj(tokens[:, 1:])
                     features = adapter.forward_features(images)
                 torch.testing.assert_close(features.global_features, expected_global, rtol=0, atol=0)
                 torch.testing.assert_close(features.local_features, expected_local, rtol=0, atol=0)
@@ -364,12 +370,11 @@ class OpenCLIPVisualIntegrationTests(unittest.TestCase):
         with torch.no_grad():
             self.assertEqual(visual(torch.randn(2, 3, 8, 8)).shape, (2, 8))
 
-    def test_full_canonical_visual_towers_construct_without_text_or_weight_downloads(self):
+    def test_full_canonical_biomedclip_tower_constructs_without_text_or_weight_downloads(self):
         for name in vlm.RELEASES:
             payload = _config_payload(name)
-            if name == "biomedclip":
-                payload["model_cfg"]["vision_cfg"].pop("image_size")
-                payload["model_cfg"]["vision_cfg"]["timm_pool"] = ""
+            payload["model_cfg"]["vision_cfg"].pop("image_size")
+            payload["model_cfg"]["vision_cfg"]["timm_pool"] = ""
             release, vision = vlm._release_config({"model": name}, payload)
             with self.subTest(name=name), patch(
                     "transformers.AutoModel.from_pretrained", side_effect=AssertionError("Text model prohibited")), patch(
@@ -381,14 +386,9 @@ class OpenCLIPVisualIntegrationTests(unittest.TestCase):
                 self.assertEqual(visual.trunk.patch_embed.img_size, (release["image_size"],) * 2)
                 self.assertEqual(visual.trunk.blocks[0].attn.qkv.weight.shape, (2304, 768))
                 keys = set(visual.state_dict())
-                if name == "biomedclip":
-                    self.assertEqual(visual.head.proj.weight.shape, (512, 768))
-                    self.assertIn("head.proj.weight", keys)
-                    self.assertIn("trunk.cls_token", keys)
-                else:
-                    self.assertIn("trunk.attn_pool.q.weight", keys)
-                    self.assertNotIn("trunk.cls_token", keys)
-                    self.assertNotIn("head.proj.weight", keys)
+                self.assertEqual(visual.head.proj.weight.shape, (512, 768))
+                self.assertIn("head.proj.weight", keys)
+                self.assertIn("trunk.cls_token", keys)
                 del visual
 
 

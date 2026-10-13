@@ -125,6 +125,28 @@ class VLMUpdateTests(unittest.TestCase):
         self.assertFalse((self.project / ".foundation-vlm-update.lock").exists())
         self.assertFalse((self.project / "runs").exists())
 
+    def test_targeted_fix_skips_unrelated_local_edits_and_missing_payloads(self):
+        selected = "foundation_sft/models/new.py"
+        self.trainer.write_bytes(self.old + b"CUSTOM = True\n")
+        before = self.trainer.read_bytes()
+        (self.source / "foundation_sft/configs/new.json").unlink()
+        with patch.object(updater, "XRAY_UPDATE_FILES", (selected,)), redirect_stdout(io.StringIO()):
+            backup = updater.install(self.project, self.source, apply=True, xray_siglip_only=True)
+        self.assertEqual(self.trainer.read_bytes(), before)
+        self.assertEqual((self.project / selected).read_bytes(), self.payloads[selected])
+        self.assertFalse((self.project / "foundation_sft/configs/new.json").exists())
+        self.assertEqual(json.loads((backup / "installation.json").read_text())["files"], [selected])
+        self.assertEqual(self.preserved.read_bytes(), b'{"data":"user-specific"}\n')
+
+    def test_targeted_fix_does_not_bypass_selected_file_checks(self):
+        selected = "foundation_sft/models/new.py"
+        (self.source / selected).write_bytes(b"TAMPERED = True\n")
+        with patch.object(updater, "XRAY_UPDATE_FILES", (selected,)), self.assertRaisesRegex(ValueError, "checksum"):
+            updater.install(self.project, self.source, apply=True, xray_siglip_only=True)
+        self.assertEqual(self.trainer.read_bytes(), self.old)
+        self.assertFalse((self.project / selected).exists())
+        self.assertFalse((self.project / ".foundation-vlm-update.lock").exists())
+
 
 class VLMManifestTests(unittest.TestCase):
     def test_published_manifest_matches_payloads_and_excludes_existing_data_configs(self):
