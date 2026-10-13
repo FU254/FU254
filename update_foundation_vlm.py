@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import uuid
 
@@ -118,15 +119,23 @@ FILES = {
     },
     "foundation_sft/FOUNDATION_VLM_SETUP.md": {
         "previous": [
-            None
+            None,
+            "84115fddbdf4905302b9a812690d665581072bf1a0483add4bfc2f4dcda0b512"
         ],
-        "updated": "84115fddbdf4905302b9a812690d665581072bf1a0483add4bfc2f4dcda0b512"
+        "updated": "54db128b625ed409b7ceee1c46534a389eb791dd9a81b149ea7f01ffabe39bbd"
     }
 }
 
 
 def _digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _unlink_if_present(path):
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _path(root, relative):
@@ -151,10 +160,13 @@ def _atomic_write(path, data, mode):
         temporary.chmod(mode)
         os.replace(temporary, path)
     finally:
-        temporary.unlink(missing_ok=True)
+        _unlink_if_present(temporary)
 
 
 def install(project, source_dir, *, apply=False):
+    if sys.version_info < (3, 10):
+        raise ValueError("Python 3.10 or newer is required. Run conda activate evax_lora "
+                         "before this installer; no installation lock was created.")
     project = Path(project).expanduser().resolve()
     source = Path(source_dir).expanduser().resolve()
     if project == source:
@@ -225,14 +237,14 @@ def install(project, source_dir, *, apply=False):
         except BaseException:
             for relative in reversed(replaced):
                 if originals[relative] is None:
-                    (project / relative).unlink(missing_ok=True)
+                    _unlink_if_present(project / relative)
                 else:
                     _atomic_write(project / relative, originals[relative], modes[relative])
             raise
         print(f"Updated {len(pending)} files. Previous sources: {backup}", flush=True)
         return backup
     finally:
-        lock.unlink(missing_ok=True)
+        _unlink_if_present(lock)
 
 
 def main(argv=None):

@@ -105,6 +105,26 @@ class VLMUpdateTests(unittest.TestCase):
         self.assertEqual(lock.read_text(), "another installer")
         self.assertEqual(self.trainer.read_bytes(), self.old)
 
+    def test_old_python_is_rejected_before_creating_lock_or_reading_payloads(self):
+        with patch.object(updater.sys, "version_info", (3, 7, 17)), patch.object(
+                updater, "_path", side_effect=AssertionError("Old interpreter must not read payloads")):
+            with self.assertRaisesRegex(ValueError, "conda activate evax_lora"):
+                self.install(True)
+        self.assertEqual(self.trainer.read_bytes(), self.old)
+        self.assertFalse((self.project / ".foundation-vlm-update.lock").exists())
+        self.assertFalse((self.project / "runs").exists())
+
+    def test_invalid_python_payload_leaves_no_lock_or_project_changes(self):
+        relative = "foundation_sft/models/new.py"
+        invalid = b"def broken(:\n"
+        (self.source / relative).write_bytes(invalid)
+        self.manifest[relative]["updated"] = updater._digest(invalid)
+        with self.assertRaises(SyntaxError):
+            self.install(True)
+        self.assertEqual(self.trainer.read_bytes(), self.old)
+        self.assertFalse((self.project / ".foundation-vlm-update.lock").exists())
+        self.assertFalse((self.project / "runs").exists())
+
 
 class VLMManifestTests(unittest.TestCase):
     def test_published_manifest_matches_payloads_and_excludes_existing_data_configs(self):

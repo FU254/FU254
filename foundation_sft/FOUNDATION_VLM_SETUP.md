@@ -77,8 +77,10 @@ Get-FileHash -Algorithm SHA256 'D:\99\EVA-X-main\foundation_weights\biomedclip\o
 
 ```bash
 cd /home/cfu/EVA-X-main
+conda activate evax_lora
+python --version
 
-# 先只检查上传文件和现有代码，列出计划更新的文件。
+# 使用 evax_lora 的 Python 3.10 或更新版本，先检查上传文件和现有代码。
 python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update
 
 # 检查通过后，备份旧代码并应用本次更新。
@@ -86,6 +88,15 @@ python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update -
 ```
 
 更新器核对固定源码校验值与已知旧版本，只更新本次运行所需的适配器、公共运行模块、新配置、依赖文件和本文；已有代码有未识别修改时会停止，检查失败不会覆盖任何代码。旧代码保存在 `runs/foundation_sft_vlm/code_backups/`。`configs/common.json`、原 `configs/experiments.json`、数据、权重和已有实验结果均不改动。更新器本身不安装依赖、不联网、不训练。
+
+如果曾使用旧 `base` Python 运行旧版更新器，可能出现 `:=` 的 SyntaxError，以及 `unlink(missing_ok=True)` 的 TypeError。此错误发生在写入前的校验阶段。确认上一条更新命令已经退出后，在项目根目录用已激活的 `evax_lora` 清理残留锁，再重新检查：
+
+```bash
+python -c "from pathlib import Path; p=Path('.foundation-vlm-update.lock'); p.unlink() if p.exists() else None"
+python vlm_update/update_foundation_vlm.py --project . --source-dir vlm_update
+```
+
+不要修改 `chexzero.py` 或关闭源码校验来迁就旧解释器。新版更新器会在创建锁前拒绝过旧的 Python。
 
 然后上传四个新权重目录到项目的 `foundation_weights/`。代码应用完成后，核心文件位置如下：
 
