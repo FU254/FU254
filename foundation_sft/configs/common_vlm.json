@@ -1,0 +1,9 @@
+{
+  "base_config": "common.json",
+  "output_root": "runs/foundation_sft_vlm",
+  "training": {
+    "amp": false,
+    "batch_size": 8,
+    "accumulation_steps": 8
+  }
+}

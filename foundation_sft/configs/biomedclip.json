@@ -1,0 +1,8 @@
+{
+  "base_config": "common_vlm.json",
+  "model": "biomedclip",
+  "model_dir": "foundation_weights/biomedclip",
+  "checkpoint": "open_clip_pytorch_model.bin",
+  "checkpoint_source": "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
+  "normalize_image_embedding": false
+}

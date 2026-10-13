@@ -1,4 +1,4 @@
-# 六个胸片基础模型的监督训练
+# 胸片基础模型的监督训练
 
 当前进度、服务器路径和下一步操作见 [项目交接文档](PROJECT_HANDOFF.md)。
 
@@ -404,3 +404,7 @@ MPLBACKEND=Agg OMP_NUM_THREADS=2 python -m unittest discover -s tests -p 'test_*
 真实权重、DICOM 解码依赖和远端 GPU 路径仍以每个配置的 `prepare`、`smoke` 结果为准。压缩 DICOM 若缺少解码器，应根据其传输语法安装相匹配的 pydicom 解码插件。
 
 患者清单、预测、数据和权重只保存在服务器或本地实验目录，不提交 Git。本仓库 `.gitignore` 已排除默认实验和权重目录。
+
+## 新增四个视觉语言模型
+
+CXR-CLIP、XraySigLIP、BiomedCLIP 和 CheXzero 的视觉编码器现已接入同一线性探测 / LoRA 训练接口。新配置为 `configs/experiments_vlm.json`，复用既有患者划分，结果独立保存到 `runs/foundation_sft_vlm`。新训练同时记录验证损失并保存训练曲线；操作步骤、官方权重入口及离线更新方法见 [FOUNDATION_VLM_SETUP.md](FOUNDATION_VLM_SETUP.md)。

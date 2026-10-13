@@ -122,12 +122,19 @@ def _loader(split, name, adapter, config, generator=None):
                       worker_init_fn=_seed_worker, generator=generator)
 
 
-def predict(model, loader, device):
+def predict(model, loader, device, *, criterion=None):
     model.eval()
     rows = []
+    total_loss, total_images = 0.0, 0
     with torch.no_grad():
         for batch in loader:
             logits = model(batch["image"].to(device, non_blocking=True))
+            if criterion is not None:
+                loss = criterion(logits, batch["label"].to(device, non_blocking=True))
+                if not torch.isfinite(loss).item():
+                    raise RuntimeError("Non-finite validation loss")
+                total_loss += loss.item() * len(batch["label"])
+                total_images += len(batch["label"])
             probabilities = logits.sigmoid().cpu().numpy()
             if not np.isfinite(probabilities).all():
                 raise RuntimeError("Non-finite validation/test predictions")
@@ -135,7 +142,12 @@ def predict(model, loader, device):
                     batch["sample_id"], batch["patient_id"], batch["label"].numpy(), probabilities):
                 rows.append({"sample_id": sample, "patient_id": patient,
                              "label": int(label), "probability": float(probability)})
-    return pd.DataFrame(rows)
+    predictions = pd.DataFrame(rows)
+    if criterion is not None:
+        if not total_images:
+            raise ValueError("Validation loader contains no images")
+        return predictions, total_loss / total_images
+    return predictions
 
 
 def _train_epoch(model, loader, optimizer, criterion, device, train, scaler):
@@ -335,7 +347,7 @@ def run_training(config, adapter=None, resume=None, *, resume_full_precision=Fal
     print(f"Run directory: {run.resolve()}", flush=True)
     for epoch in range(start_epoch, train["epochs"]):
         loss = _train_epoch(model, train_loader, optimizer, criterion, device, train, scaler)
-        validation = predict(model, val_loader, device)
+        validation, val_loss = predict(model, val_loader, device, criterion=criterion)
         patient_validation = aggregate_patient_predictions(validation)
         metrics = binary_metrics(patient_validation.label, patient_validation.probability)
         val_auc = metrics["roc_auc"]
@@ -346,7 +358,8 @@ def run_training(config, adapter=None, resume=None, *, resume_full_precision=Fal
             best_model = {name: tensor.clone() for name, tensor in model.trainable_state_dict().items()}
         else:
             bad_epochs += 1
-        history.append({"epoch": epoch + 1, "train_loss": loss, "val_patient_roc_auc": val_auc,
+        history.append({"epoch": epoch + 1, "train_loss": loss, "val_loss": val_loss,
+                        "val_patient_roc_auc": val_auc,
                         "val_patient_pr_auc": metrics["pr_auc"],
                         "learning_rates": [group["lr"] for group in optimizer.param_groups]})
         print(json.dumps(history[-1]), flush=True)
@@ -362,6 +375,8 @@ def run_training(config, adapter=None, resume=None, *, resume_full_precision=Fal
             break
     if best_model is None:
         raise RuntimeError("No best checkpoint was produced")
+    from .training_history import save_history_plots
+    save_history_plots(history, run)
     model.load_trainable_state_dict(best_model)
     validation = predict(model, val_loader, device)
     patients = aggregate_patient_predictions(validation)

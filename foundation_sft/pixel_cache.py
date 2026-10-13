@@ -33,12 +33,14 @@ def _resize_signature(preprocess):
     mode = _spec_value(preprocess, "resize_mode", "resize")
     equalize = _spec_value(preprocess, "do_hist_equalization", False)
     interpolation = _spec_value(preprocess, "interpolation", "bicubic")
-    if size < 1 or mode not in {"resize", "letterbox", "shortest_edge_center_crop"}:
+    if size < 1 or mode not in {"resize", "letterbox", "shortest_edge_center_crop", "chexzero_pad320"}:
         raise PixelCacheError("Invalid deterministic image resize configuration.")
     if interpolation not in {"nearest", "bilinear", "bicubic", "lanczos", "box", "hamming"}:
         raise PixelCacheError("Invalid deterministic image interpolation configuration.")
     if not isinstance(equalize, bool):
         raise PixelCacheError("Histogram equalization must be a boolean.")
+    if mode == "chexzero_pad320" and (size != 224 or interpolation != "bicubic" or equalize):
+        raise PixelCacheError("CheXzero preprocessing requires 224 pixels, bicubic interpolation, and no equalization.")
     edge = int(_spec_value(preprocess, "resize_shortest_edge") or size)
     if mode == "shortest_edge_center_crop" and edge < 1:
         raise PixelCacheError("Invalid deterministic image shortest edge configuration.")

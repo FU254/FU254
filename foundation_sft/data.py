@@ -341,6 +341,24 @@ def _resize_image(pixels, preprocess):
     image = Image.fromarray(pixels)
     width, height = image.size
     resample = resamplers[interpolation]
+    if mode == "chexzero_pad320":
+        if size != 224 or interpolation != "bicubic" or equalize:
+            raise ValueError("CheXzero requires the verified 320-pad/224-bicubic protocol")
+        # Match the release's long-edge geometry before its 224 input resize.
+        # DICOM display normalization and final range clipping are the shared
+        # downstream protocol; do not claim parity with the author's PNG input.
+        initial = Image.fromarray((np.clip(pixels, 0.0, 1.0) * 255.0).astype(np.uint8))
+        factor = 320.0 / max(initial.size)
+        dimensions = (max(1, int(initial.width * factor)), max(1, int(initial.height * factor)))
+        resized = initial.resize(dimensions, resample=Image.Resampling.LANCZOS)
+        canvas = Image.new("L", (320, 320), 0)
+        canvas.paste(resized, ((320 - resized.width) // 2, (320 - resized.height) // 2))
+        tensor = torch.from_numpy(np.asarray(canvas, dtype=np.float32).copy()) / 255.0
+        resized_tensor = torch.nn.functional.interpolate(
+            tensor[None, None], size=(224, 224), mode="bicubic", align_corners=False,
+            antialias=False,
+        )[0, 0]
+        return np.clip(resized_tensor.numpy(), 0.0, 1.0).astype(np.float32)
     if mode == "resize":
         image = image.resize((size, size), resample=resample)
     elif mode == "shortest_edge_center_crop":
@@ -360,7 +378,7 @@ def _resize_image(pixels, preprocess):
         canvas.paste(resized, ((size - resized.width) // 2, (size - resized.height) // 2))
         image = canvas
     else:
-        raise ValueError("resize_mode must be resize, letterbox, or shortest_edge_center_crop.")
+        raise ValueError("Unknown deterministic image resize mode.")
     result = np.asarray(image, dtype=np.float32)
     if equalize:
         result = result / 255.0

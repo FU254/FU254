@@ -12,14 +12,41 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from PIL import Image, ImageOps
 import pydicom
 from pydicom.dataset import FileDataset, FileMetaDataset
 from pydicom.uid import ExplicitVRLittleEndian, SecondaryCaptureImageStorage, generate_uid
 import torch
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as torchvision_functional
 
 from foundation_sft.data import CXRDataset, _dicom_pixels, _resize_image
 from foundation_sft.models.common import PreprocessSpec
 from foundation_sft.pixel_cache import PixelCache, PixelCacheError
+
+
+def _chexzero_geometry_reference(display_pixels):
+    """Independent PIL/torchvision rendition of the released image geometry.
+
+    The input display pixels intentionally use this study's shared DICOM
+    rendering. This verifies the released geometry, not original PNG parity.
+    """
+    source = Image.fromarray((np.clip(display_pixels, 0, 1) * 255).astype(np.uint8))
+    width, height = source.size
+    # The official release truncates floating-point products. Preserve its
+    # 77-pixel edge case (319, not idealized 320) rather than integer division.
+    # A one-pixel minimum is the shared defensive extension for extreme aspect
+    # ratios where the original release's PIL resize would reject a zero side.
+    release_ratio = float(320) / max(source.size)
+    dimensions = tuple(max(1, int(edge * release_ratio)) for edge in source.size)
+    resized = source.resize(dimensions, Image.Resampling.LANCZOS)
+    left, top = (320 - dimensions[0]) // 2, (320 - dimensions[1]) // 2
+    padded = ImageOps.expand(resized, border=(left, top, 320 - dimensions[0] - left,
+                                            320 - dimensions[1] - top), fill=0)
+    tensor = torchvision_functional.to_tensor(padded)
+    output = torchvision_functional.resize(tensor, [224, 224],
+                                           interpolation=InterpolationMode.BICUBIC, antialias=False)
+    return output.clamp(0, 1).squeeze(0).numpy()
 
 
 class PixelCacheTests(unittest.TestCase):
@@ -77,6 +104,66 @@ class PixelCacheTests(unittest.TestCase):
                         np.testing.assert_array_equal(direct, first)
                         np.testing.assert_array_equal(direct, second)
                         self.assertEqual(second.dtype, np.float32)
+
+    def test_real_dicom_chexzero_cache_exactly_matches_independent_geometry_reference(self):
+        spec = PreprocessSpec(224, resize_mode="chexzero_pad320")
+        display = _dicom_pixels(pydicom.dcmread(self.path))
+        reference = _chexzero_geometry_reference(display)
+        direct = self.decode(spec)
+        cache = PixelCache(self.cache_dir)
+        with patch("pydicom.dcmread", wraps=pydicom.dcmread) as decoder:
+            first = cache.get(self.path, spec, lambda: self.decode(spec))
+            hit = cache.get(self.path, spec, lambda: self.fail("CheXzero cache hit decoded DICOM"))
+        self.assertEqual(decoder.call_count, 1)
+        self.assertEqual(direct.shape, (224, 224))
+        self.assertEqual(direct.dtype, np.float32)
+        self.assertTrue(np.isfinite(direct).all())
+        self.assertGreaterEqual(float(direct.min()), 0)
+        self.assertLessEqual(float(direct.max()), 1)
+        np.testing.assert_array_equal(direct, reference)
+        np.testing.assert_array_equal(first, direct)
+        np.testing.assert_array_equal(hit, direct)
+
+    def test_chexzero_geometry_matches_release_float_floor_and_odd_black_padding(self):
+        spec = PreprocessSpec(224, resize_mode="chexzero_pad320")
+        for shape in ((13, 19), (19, 13), (37, 77), (77, 37), (71, 71), (1, 513)):
+            with self.subTest(shape=shape):
+                display = (np.arange(np.prod(shape), dtype=np.float32).reshape(shape) % 83) / 82
+                actual = _resize_image(display, spec)
+                expected = _chexzero_geometry_reference(display)
+                np.testing.assert_array_equal(actual, expected)
+                self.assertEqual(actual.shape, (224, 224))
+                self.assertEqual(actual.dtype, np.float32)
+                self.assertGreaterEqual(float(actual.min()), 0)
+                self.assertLessEqual(float(actual.max()), 1)
+                if shape[1] > shape[0] * 1.5:
+                    np.testing.assert_array_equal(actual[0], np.zeros(224, dtype=np.float32))
+
+    def test_chexzero_and_ordinary_224_resize_do_not_share_cache_entries(self):
+        cache = PixelCache(self.cache_dir)
+        chexzero = PreprocessSpec(224, resize_mode="chexzero_pad320")
+        ordinary = PreprocessSpec(224, resize_mode="resize")
+        with patch("pydicom.dcmread", wraps=pydicom.dcmread) as decoder:
+            chexzero_pixels = cache.get(self.path, chexzero, lambda: self.decode(chexzero))
+            ordinary_pixels = cache.get(self.path, ordinary, lambda: self.decode(ordinary))
+        self.assertEqual(decoder.call_count, 2)
+        self.assertFalse(np.array_equal(chexzero_pixels, ordinary_pixels))
+        for spec, pixels in ((chexzero, chexzero_pixels), (ordinary, ordinary_pixels)):
+            np.testing.assert_array_equal(cache.get(self.path, spec, lambda: self.fail("Expected cached mode")), pixels)
+        self.assertEqual(len(list(cache.directory.glob("*.npy"))), 2)
+
+    def test_chexzero_rejects_non_224_non_bicubic_or_equalized_specs_before_cache_build(self):
+        valid = PreprocessSpec(224, resize_mode="chexzero_pad320")
+        cache = PixelCache(self.cache_dir)
+        for spec in (replace(valid, image_size=223), replace(valid, image_size=320),
+                     replace(valid, interpolation="bilinear"), replace(valid, interpolation="lanczos"),
+                     replace(valid, do_hist_equalization=True)):
+            with self.subTest(spec=spec):
+                with self.assertRaisesRegex(PixelCacheError, "CheXzero preprocessing requires"):
+                    cache.get(self.path, spec, lambda: self.fail("Invalid CheXzero spec built cache"))
+                with self.assertRaisesRegex(ValueError, "CheXzero requires"):
+                    self.decode(spec)
+        self.assertEqual(list(cache.directory.glob("*.npy")), [])
 
     def test_one_decode_per_source_and_preprocess_across_instances_and_modes(self):
         spec = PreprocessSpec(11)
@@ -278,6 +365,43 @@ class PixelCacheTests(unittest.TestCase):
         torch.testing.assert_close(first, direct_augmented[0]["image"], rtol=0, atol=0)
         torch.manual_seed(91)
         torch.testing.assert_close(second, direct_augmented[0]["image"], rtol=0, atol=0)
+
+    def test_chexzero_cache_reuses_only_pixels_and_keeps_normalization_and_augmentation_fresh(self):
+        stat = self.path.stat()
+        cohort = pd.DataFrame([{
+            "path": str(self.path), "label": 1, "sample_id": "synthetic-image",
+            "patient_id": "synthetic-patient", "dicom_size": stat.st_size,
+            "dicom_mtime_ns": stat.st_mtime_ns,
+        }])
+        spec = PreprocessSpec(224, mean=(101.48761 / 255,) * 3, std=(83.43944 / 255,) * 3,
+                              resize_mode="chexzero_pad320")
+        plain = CXRDataset(cohort, spec)
+        cached = CXRDataset(cohort, spec, cache_dir=self.cache_dir)
+        direct = plain[0]["image"]
+        torch.testing.assert_close(cached[0]["image"], direct, rtol=0, atol=0)
+        alternate = replace(spec, mean=(0.1, 0.2, 0.3), std=(0.4, 0.5, 0.6))
+        with patch("pydicom.dcmread", side_effect=AssertionError("Normalization change decoded DICOM")):
+            alternate_image = CXRDataset(cohort, alternate, cache_dir=self.cache_dir)[0]["image"]
+        shared_pixels = torch.from_numpy(self.decode(spec)).expand(3, -1, -1)
+        expected = ((shared_pixels - torch.tensor(alternate.mean).view(3, 1, 1))
+                    / torch.tensor(alternate.std).view(3, 1, 1))
+        torch.testing.assert_close(alternate_image, expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(alternate_image, direct))
+        augmented = CXRDataset(cohort, spec, training=True, rotation_degrees=15,
+                               horizontal_flip_probability=0.5, cache_dir=self.cache_dir)
+        direct_augmented = CXRDataset(cohort, spec, training=True, rotation_degrees=15,
+                                      horizontal_flip_probability=0.5)
+        with patch("pydicom.dcmread", side_effect=AssertionError("CheXzero augmentation decoded DICOM")):
+            torch.manual_seed(8)
+            first = augmented[0]["image"]
+            torch.manual_seed(91)
+            second = augmented[0]["image"]
+        self.assertFalse(torch.equal(first, second))
+        torch.manual_seed(8)
+        torch.testing.assert_close(first, direct_augmented[0]["image"], rtol=0, atol=0)
+        torch.manual_seed(91)
+        torch.testing.assert_close(second, direct_augmented[0]["image"], rtol=0, atol=0)
+        self.assertEqual(len(list((self.cache_dir / "pixels").glob("*.npy"))), 1)
 
 
 if __name__ == "__main__":

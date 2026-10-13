@@ -1,6 +1,7 @@
 """Model imports are lazy so each encoder can use its own supported environment."""
 
-SUPPORTED_MODELS = ("eva_x", "rad_dino", "ray_dino", "chexfound", "cxformer", "radjepa")
+SUPPORTED_MODELS = ("eva_x", "rad_dino", "ray_dino", "chexfound", "cxformer", "radjepa",
+                    "cxr_clip", "xray_siglip", "biomedclip", "chexzero")
 
 
 def build_adapter(config):
@@ -23,4 +24,13 @@ def build_adapter(config):
     if name == "radjepa":
         from .radjepa import build_radjepa
         return build_radjepa(config)
+    if name == "cxr_clip":
+        from .cxr_clip import build_cxr_clip
+        return build_cxr_clip(config)
+    if name in {"xray_siglip", "biomedclip"}:
+        from .openclip_vlm import build_openclip_vlm
+        return build_openclip_vlm(config)
+    if name == "chexzero":
+        from .chexzero import build_chexzero
+        return build_chexzero(config)
     raise ValueError(f"Unknown model {name!r}; choose from {SUPPORTED_MODELS}")

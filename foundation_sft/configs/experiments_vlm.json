@@ -1,0 +1,12 @@
+{
+  "modes": ["linear_probe", "lora"],
+  "seeds": [42],
+  "suite_root": "runs/foundation_sft_vlm/suites",
+  "conda_executable": "/opt/anaconda3/bin/conda",
+  "jobs": [
+    {"model": "cxr_clip", "config": "foundation_sft/configs/cxr_clip.json", "env": "evax_lora", "device": "cuda:0"},
+    {"model": "xray_siglip", "config": "foundation_sft/configs/xray_siglip.json", "env": "cxr_openclip", "device": "cuda:1"},
+    {"model": "biomedclip", "config": "foundation_sft/configs/biomedclip.json", "env": "cxr_openclip", "device": "cuda:2"},
+    {"model": "chexzero", "config": "foundation_sft/configs/chexzero.json", "env": "evax_lora", "device": "cuda:3"}
+  ]
+}

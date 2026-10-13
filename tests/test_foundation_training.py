@@ -184,7 +184,11 @@ class FoundationTrainingTests(unittest.TestCase):
                 np.testing.assert_allclose(threshold_selector.call_args.args[1], patients.probability, rtol=0, atol=1e-14)
                 test_metrics = json.loads((run / "test" / "metrics.json").read_text())
                 self.assertEqual(test_metrics["patient"]["threshold"], best["threshold"])
-                self.assertEqual(len(json.loads((run / "history.json").read_text())), 2)
+                history = json.loads((run / "history.json").read_text())
+                self.assertEqual(len(history), 2)
+                self.assertTrue(all(np.isfinite(row["val_loss"]) and row["val_loss"] >= 0 for row in history))
+                for filename in ("training_loss.png", "validation_auc.png"):
+                    self.assertGreater((run / filename).stat().st_size, 1000)
                 # Build a fresh real encoder from the local snapshot and reload best.pt.
                 with redirect_stdout(io.StringIO()), patch.object(trainer, "select_threshold", wraps=select_threshold) as evaluation_selector:
                     evaluated = trainer.evaluate(config, run / "best.pt")

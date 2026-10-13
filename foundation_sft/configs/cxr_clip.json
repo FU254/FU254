@@ -1,0 +1,6 @@
+{
+  "base_config": "common_vlm.json",
+  "model": "cxr_clip",
+  "checkpoint": "foundation_weights/cxr_clip/swint_mcc.tar",
+  "checkpoint_source": "https://twg.kakaocdn.net/brainrepo/models/cxr-clip/a25ce760064591c899f67c97ed7790de/swint_mcc.tar"
+}
