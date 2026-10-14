@@ -137,6 +137,29 @@ python run_foundation_experiments.py --seeds 42 43 44
 
 终端打印各阶段状态；失败时会附上对应日志最后 12 行，显示具体异常。训练每轮进展写入日志。用实际打印的路径查看，例如 `tail -f <suite目录>/logs/chexfound_lora_seed42_train.log`。单模型训练目录还保存独立的 ROC/PR/校准图和 `history.json`。
 
+## 查看所有已保存实验
+
+`recover_experiment --suite ... --show-metrics` 只查看指定批次。基础模型、VLM 和恢复任务可能位于不同目录。根目录新增独立查看脚本，使用标准库，兼容 Python 3.7 语法；只需上传这个文件，不需要替换训练代码或安装依赖：
+
+```bash
+python show_foundation_results.py --project /home/cfu/EVA-X-main
+```
+
+默认扫描项目 `runs/foundation_sft*` 下的所有已开始训练批次，包含 `foundation_sft_vlm`、`foundation_sft_imagenet`，并查看未归属批次的单模型训练和独立评估结果。它还读取 `configs/experiments*.json` 的计划；扫描范围内没有对应训练记录的模型/模式/种子，会显示 `no_saved_run`，不会捏造指标。不同批次分别显示，原失败记录与每次 FP32 恢复都保留，不按模型/模式/种子去重，不挑选较高测试分数。它只读取配置和指标，不读 DICOM、患者预测或 checkpoint，不启动训练，不改写旧结果。仅检查、未开始训练的批次会显示省略数量；加 `--include-checks` 可查看这些状态。
+
+```bash
+# 只显示已完成的训练/恢复/评估记录。
+python show_foundation_results.py --project /home/cfu/EVA-X-main --completed-only
+
+# 查看目前选定的八模型，每个模型的所有模式/种子/批次及恢复记录保留。
+python show_foundation_results.py --project /home/cfu/EVA-X-main --models eva_x rad_dino chexfound cxformer radjepa xray_siglip biomedclip chexzero
+
+# 同时导出到一个尚未存在的新 CSV，可在电脑 Excel 中查看。
+python show_foundation_results.py --project /home/cfu/EVA-X-main --csv runs/all_foundation_results_01.csv
+```
+
+CSV 保留批次、运行路径、精度变化、完整数据/标签来源/分组指纹及各项患者测试指标。该表是结果清单，不做跨批次平均或统一排名；正式比较仍使用原报告的共同患者/标签和实验规范核对。ROC 区间使用记录里的置信水平，PR-AUC 与 AP 分别列出。损坏或缺失的记录会注明诊断，其他批次继续显示。新增 13 项标准库测试在 Python 3.12 和 3.10 下通过，覆盖不同结果目录、恢复历史、独立评估、避免漏项与重复、九模型计划缺失项、原结果不变及 Python 3.7 语法兼容；未在真实 Python 3.7 解释器执行。
+
 ## 全量像素检查与原图恢复
 
 `prepare` 检查 DICOM 头与标签，`smoke` 只检查一个小批次，二者无法证明所有影像完整。统一实验流程现在先在每个不同 Conda 环境里解码全部训练、验证、测试影像；任一失败都会在加载模型、正式训练之前阻止实验。手动检查也可以使用下面的命令，审核目录需使用一个尚未存在的新名字：
