@@ -1,0 +1,14 @@
+# Install into a clone of evax_lora with --no-deps. Never replace the original
+# environment's PyTorch/CUDA/torchvision or its EVA-X-compatible timm version.
+open_clip_torch==2.23.0
+timm==0.9.12
+ftfy==6.1.1
+sentencepiece==0.2.0
+# Non-Torch dependencies; cloned scientific and Transformers packages are reused.
+regex>=2023.6.3
+tqdm>=4.65,<5
+huggingface-hub>=0.19,<1
+protobuf>=3.20,<6
+wcwidth>=0.2.5,<1
+PyYAML>=6,<7
+safetensors>=0.4,<1

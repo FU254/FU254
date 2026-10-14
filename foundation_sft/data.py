@@ -86,6 +86,14 @@ def _patient_identity(row, dicom, settings):
 
 
 def build_cohort(config):
+    cache_dir = config.get("cache_dir")
+    if cache_dir:
+        from .cohort_cache import cached_cohort
+        return cached_cohort(config, cache_dir, _build_cohort_uncached)
+    return _build_cohort_uncached(config)
+
+
+def _build_cohort_uncached(config):
     """Match strict workbook labels to DICOM headers without loading a pixel cache.
 
     Only configured Excel patient IDs or DICOM PatientID identify patients by
@@ -333,6 +341,24 @@ def _resize_image(pixels, preprocess):
     image = Image.fromarray(pixels)
     width, height = image.size
     resample = resamplers[interpolation]
+    if mode == "chexzero_pad320":
+        if size != 224 or interpolation != "bicubic" or equalize:
+            raise ValueError("CheXzero requires the verified 320-pad/224-bicubic protocol")
+        # Match the release's long-edge geometry before its 224 input resize.
+        # DICOM display normalization and final range clipping are the shared
+        # downstream protocol; do not claim parity with the author's PNG input.
+        initial = Image.fromarray((np.clip(pixels, 0.0, 1.0) * 255.0).astype(np.uint8))
+        factor = 320.0 / max(initial.size)
+        dimensions = (max(1, int(initial.width * factor)), max(1, int(initial.height * factor)))
+        resized = initial.resize(dimensions, resample=Image.Resampling.LANCZOS)
+        canvas = Image.new("L", (320, 320), 0)
+        canvas.paste(resized, ((320 - resized.width) // 2, (320 - resized.height) // 2))
+        tensor = torch.from_numpy(np.asarray(canvas, dtype=np.float32).copy()) / 255.0
+        resized_tensor = torch.nn.functional.interpolate(
+            tensor[None, None], size=(224, 224), mode="bicubic", align_corners=False,
+            antialias=False,
+        )[0, 0]
+        return np.clip(resized_tensor.numpy(), 0.0, 1.0).astype(np.float32)
     if mode == "resize":
         image = image.resize((size, size), resample=resample)
     elif mode == "shortest_edge_center_crop":
@@ -352,7 +378,7 @@ def _resize_image(pixels, preprocess):
         canvas.paste(resized, ((size - resized.width) // 2, (size - resized.height) // 2))
         image = canvas
     else:
-        raise ValueError("resize_mode must be resize, letterbox, or shortest_edge_center_crop.")
+        raise ValueError("Unknown deterministic image resize mode.")
     result = np.asarray(image, dtype=np.float32)
     if equalize:
         result = result / 255.0
@@ -363,12 +389,17 @@ class CXRDataset(Dataset):
     """Return images and identities from one frozen cohort, without eager arrays."""
 
     def __init__(self, cohort, preprocess, training=False, seed=42,
-                 horizontal_flip_probability=0.0, horizontal_flip_p=None, rotation_degrees=0.0):
+                 horizontal_flip_probability=0.0, horizontal_flip_p=None, rotation_degrees=0.0,
+                 cache_dir=None):
         required = {"sample_id", "patient_id", "path", "label"}
         if required.difference(cohort.columns):
             raise ValueError("Dataset cohort is missing required columns.")
         self.cohort = cohort.reset_index(drop=True).copy()
         self.preprocess = preprocess
+        self.pixel_cache = None
+        if cache_dir:
+            from .pixel_cache import PixelCache
+            self.pixel_cache = PixelCache(cache_dir)
         self.training = bool(training)
         self.seed = int(seed)
         self.horizontal_flip_probability = float(
@@ -391,14 +422,27 @@ class CXRDataset(Dataset):
 
     def __getitem__(self, index):
         row = self.cohort.iloc[index]
-        try:
-            pixels = _dicom_pixels(pydicom.dcmread(row["path"]))
-        except _DicomDataError as error:
-            raise RuntimeError(f"{error} Cohort row {index}.") from None
-        except Exception:
-            # Exceptions from decoders can include filenames or header values.
-            raise RuntimeError(f"DICOM pixel decoding failed for cohort row {index}.") from None
-        image = _resize_image(pixels, self.preprocess)
+
+        def decode():
+            try:
+                pixels = _dicom_pixels(pydicom.dcmread(row["path"]))
+            except _DicomDataError as error:
+                raise RuntimeError(f"{error} Cohort row {index}.") from None
+            except Exception:
+                # Exceptions from decoders can include filenames or header values.
+                raise RuntimeError(f"DICOM pixel decoding failed for cohort row {index}.") from None
+            return _resize_image(pixels, self.preprocess)
+
+        if self.pixel_cache is None:
+            image = decode()
+        else:
+            from .pixel_cache import PixelCacheError
+            try:
+                image = self.pixel_cache.get(row["path"], self.preprocess, decode,
+                                             expected_size=row.get("dicom_size"),
+                                             expected_mtime_ns=row.get("dicom_mtime_ns"))
+            except PixelCacheError:
+                raise RuntimeError(f"Image cache or source changed for cohort row {index}.") from None
         if self.training and self.rotation_degrees > 0:
             angle = float(torch.rand(())) * (2 * self.rotation_degrees) - self.rotation_degrees
             image = np.asarray(

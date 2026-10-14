@@ -127,3 +127,7 @@ python -m foundation_sft.train --config foundation_sft/configs/radjepa_imagenet.
 HF 依赖固定为 Transformers **4.48.3**、huggingface-hub 0.29.3、tokenizers 0.21.1 和 safetensors 0.4.5。此前的 4.50.3 在用户 Torch 2.0.1 环境导入时访问不存在的 `torch.compiler`，已据真实日志修正。4.48.3 已在独立 Python 3.10.22 / Torch 2.0.1+cpu / torchvision 0.15.2+cpu / timm 0.4.12 环境验证 DINOv2 与带 register 的 DINOv2 导入、本地权重加载、特征和 LoRA 反向；这些 CPU 软件检查不代表服务器医学权重或 CUDA 计算已经通过。更旧的 4.44/4.46 缺少 CXformer 所需内置 register 架构，不作为替代版本。
 
 每次训练保存权重和预处理指纹、LoRA 投影名称和输入网格，重新评估时核对。默认目录 `foundation_sources/`、`foundation_weights/` 和 `runs/` 已加入 Git 排除项。
+
+## 新增 CXR-CLIP / XraySigLIP / BiomedCLIP / CheXzero
+
+这四个模型的固定发布版本、官方权重下载地址、视觉特征和预处理定义、独立 OpenCLIP 环境及八项实验运行步骤见 [FOUNDATION_VLM_SETUP.md](FOUNDATION_VLM_SETUP.md)。CXR-CLIP 使用 Swin-Tiny MCC，XraySigLIP 使用 512 输入 ViT-B/16，BiomedCLIP 使用 224 输入 ViT-B/16，CheXzero 使用医学 CLIP ViT-B/32 的单个预定 checkpoint。实际发布权重需要下载后进行服务器 smoke；云端合成样本检查不代表医学性能。

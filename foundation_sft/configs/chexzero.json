@@ -1,0 +1,8 @@
+{
+  "base_config": "common_vlm.json",
+  "model": "chexzero",
+  "checkpoint": "foundation_weights/chexzero/best_64_0.0001_original_17000_0.863.pt",
+  "checkpoint_source": "https://drive.google.com/drive/folders/1makFLiEMbSleYltaRxw81aBhEDMpVwno",
+  "architecture": "ViT-B/32",
+  "image_size": 224
+}

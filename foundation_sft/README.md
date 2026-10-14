@@ -1,4 +1,4 @@
-# 六个胸片基础模型的监督训练
+# 胸片基础模型的监督训练
 
 当前进度、服务器路径和下一步操作见 [项目交接文档](PROJECT_HANDOFF.md)。
 
@@ -160,6 +160,28 @@ python show_foundation_results.py --project /home/cfu/EVA-X-main --csv runs/all_
 
 CSV 保留批次、运行路径、精度变化、完整数据/标签来源/分组指纹及各项患者测试指标。该表是结果清单，不做跨批次平均或统一排名；正式比较仍使用原报告的共同患者/标签和实验规范核对。ROC 区间使用记录里的置信水平，PR-AUC 与 AP 分别列出。损坏或缺失的记录会注明诊断，其他批次继续显示。新增 13 项标准库测试在 Python 3.12 和 3.10 下通过，覆盖不同结果目录、恢复历史、独立评估、避免漏项与重复、九模型计划缺失项、原结果不变及 Python 3.7 语法兼容；未在真实 Python 3.7 解释器执行。
 
+## 避免重复读取：可选数据缓存
+
+数据未改变时，可以复用文件头匹配、成功的完整像素审核和训练所需的确定性图像，减少重跑与每轮训练的 DICOM 读取。原命令默认不启用缓存；启动统一实验时指定一个缓存目录：
+
+```bash
+python run_foundation_experiments.py --cache-dir runs/foundation_sft/data_cache
+```
+
+首次在各环境中完整审核，并逐步缓存各模型尺寸的图像。后续同一环境的同一批文件复用成功审核，终端打印 `[audit-data] Reused successful pixel audit`；每个模型的线性探测和 LoRA 可以共享相同预处理的图像。缓存命中仍扫描文件清单、核对文件状态及 Excel 内容，但不重复解析全部 DICOM 头和像素。旧版未记录环境指纹的审核报告不会自动作为缓存使用。模型 smoke 仍逐项执行。
+
+图像缓存为单通道 float32 NPY，保存原有解码、窗宽窗位、灰阶方向及模型缩放后的精确结果。随机旋转、翻转和各模型均值方差归一化仍在每次读取时执行；缓存不改变标签、患者分组或随机增强。仅缓存模型需要的尺寸，不保存巨大的原始分辨率 float32 数组。1995 张 224×224 图像约占 0.4 GB，518×518 约占 2.1 GB；不同缩放规范、解码环境分别占用缓存，实际容量随模型配置增加。建议选择有足够空间的本地 SSD 目录。
+
+文件新增、删除、替换或状态变化，Excel/数据配置、预处理代码、Python 环境或解码依赖变化会使相关缓存失效。源文件读取期间变化仍会阻止使用。缓存是可删除的本地生成数据，目录和文件使用私有权限；缓存损坏会重新生成。修改标签或患者信息后，原有冻结划分校验仍可能拒绝新输入，需要按原有流程处理。
+
+需要重新解码全部影像时执行：
+
+```bash
+python run_foundation_experiments.py --cache-dir runs/foundation_sft/data_cache --force-audit
+```
+
+单模型入口也支持 `--cache-dir` 和 `--force-audit`，或在本地 JSON 中设置顶层 `cache_dir`。保持实验过程中源文件、依赖和代码不变；当前已启动的进程不会自动启用缓存。
+
 ## 全量像素检查与原图恢复
 
 `prepare` 检查 DICOM 头与标签，`smoke` 只检查一个小批次，二者无法证明所有影像完整。统一实验流程现在先在每个不同 Conda 环境里解码全部训练、验证、测试影像；任一失败都会在加载模型、正式训练之前阻止实验。手动检查也可以使用下面的命令，审核目录需使用一个尚未存在的新名字：
@@ -228,6 +250,59 @@ python -m foundation_sft.train --config foundation_sft/configs/cxformer.json --d
 ```
 
 修改运行种子用 `--seed 43`。比较不同种子时保留 `split_seed` 和 `split_manifest`，确保数据分组一致。
+
+## AMP 梯度累计与溢出处理
+
+统一训练循环现在在反向传播前按窗口固定分母缩小 loss，窗口结束后按实际样本数校正梯度，因此不完整窗口和不等长微批次仍对应正确的样本平均损失。这样避免在半精度反向传播中先累计过大的样本损失，再于反向结束后归一化。
+
+启用 AMP 时，若 `GradScaler.unscale_` 检测到梯度溢出，程序不裁剪该窗口的无效梯度，由 scaler 跳过更新、降低 loss scale，并清空窗口梯度。日志中的 `[amp] Skipped overflowing accumulation window` 记录这一过程。有限梯度仍使用严格裁剪；非有限 loss、非 AMP 的非有限梯度、有限梯度产生的非有限总范数仍会报错。若连续 16 个窗口溢出，或整轮没有一次成功更新，训练停止，需在独立诊断中检查完整精度计算。
+
+原 `smoke` 验证的是 FP32 的前后向、冻结参数及保存重载，没有覆盖完整训练的 AMP 和梯度累计路径。五模型的 smoke 全部通过后，仍应查看正式训练日志确认 epoch 正常完成。不要通过关闭非有限梯度检查来继续训练。修复的半精度数值回归测试使用合成样本和真实 CPU GradScaler；医学权重的 CUDA 训练需在服务器验证。
+
+### 单项训练的非有限 loss 与 FP32 恢复
+
+`Non-finite training loss` 表示前向计算的 loss 已出现 NaN/Inf，降低 GradScaler 的反向缩放不能修复这种前向错误。若上一轮 FP32 验证正常，而 AMP 训练失败，应检查输入和检查点；半精度前向溢出是可能原因，不能仅凭日志断言。原严格检查仍保留，恢复后遇到非有限 loss 或梯度也会停止。
+
+允许用 `--resume-full-precision` 明确将 **AMP 检查点转为 FP32 继续训练**。它只允许 `amp: true → false`，其他训练设置、种子、预训练权重及分组校验保持有效。优化器、调度器、随机状态、已完成轮数、历史和原最佳模型保留；原 AMP scaler 停用。新运行保存独立的 `config.json` 和 `resume.json`，记录源检查点 SHA256、精度变更和接续轮数。精度变更前的历史仍属于原 AMP 训练，这不是从第一轮开始的纯 FP32 实验。无需覆盖或改写原检查点。
+
+如果是套件中只有一项失败，可在项目根目录执行：
+
+```bash
+python -m foundation_sft.recover_experiment \
+  --suite runs/foundation_sft/suites/实际套件目录 \
+  --job cxformer_lora_seed42 --resume-full-precision
+```
+
+查看已经完成的各模型患者指标和当前任务状态，使用只读入口（套件仍在运行时也可查看）：
+
+```bash
+python -m foundation_sft.recover_experiment \
+  --suite runs/foundation_sft/suites/实际套件目录 --show-metrics
+```
+
+输出最佳验证 ROC-AUC、患者测试 ROC-AUC 及其 95% CI、梯形 PR-AUC、AP、敏感度和特异度。验证指标和测试指标分别注明；仅指定种子 42 时，患者 bootstrap CI 不代表跨种子训练波动。
+
+辅助入口从失败任务日志定位准确的 `last.pt`，进入原 Conda 环境恢复，实时显示训练日志，保存独立恢复目录和成功回执，不修改原 `suite.json`。它拒绝恢复非失败任务和同 GPU 仍有训练任务的情形；同一失败项并发恢复由独立锁阻止。确认所用 GPU 的可用显存足以运行 FP32。
+
+等原套件的其他任务结束，再使用恢复命令打印的准确恢复目录：
+
+```bash
+python -m foundation_sft.recover_experiment \
+  --suite runs/foundation_sft/suites/实际套件目录 \
+  --job cxformer_lora_seed42 --report-only \
+  --recovery-dir runs/foundation_sft/suites/实际套件目录/实际恢复目录
+```
+
+报告仅使用原套件的其他完成项与明确指定的恢复项。原失败记录和原部分报告保留，新报告输出到独立目录；完整样本/标签来源/分组指纹需一致，且原计划的每项模型、模式、种子都必须有一个成功结果。恢复记录不应通过比较测试成绩挑选。
+
+也可直接调用训练入口：
+
+```bash
+python -m foundation_sft.train --config 原配置快照.json \
+  --action train --resume 失败运行目录/last.pt --resume-full-precision
+```
+
+普通 `--resume` 仍要求训练设置完全一致。FP32 恢复后若再次正常中断，应使用新运行的 `config.json` 和 `last.pt` 做普通 `--resume`。
 
 ## 修复服务器第一次统一检查的错误
 
@@ -352,3 +427,7 @@ MPLBACKEND=Agg OMP_NUM_THREADS=2 python -m unittest discover -s tests -p 'test_*
 真实权重、DICOM 解码依赖和远端 GPU 路径仍以每个配置的 `prepare`、`smoke` 结果为准。压缩 DICOM 若缺少解码器，应根据其传输语法安装相匹配的 pydicom 解码插件。
 
 患者清单、预测、数据和权重只保存在服务器或本地实验目录，不提交 Git。本仓库 `.gitignore` 已排除默认实验和权重目录。
+
+## 新增四个视觉语言模型
+
+CXR-CLIP、XraySigLIP、BiomedCLIP 和 CheXzero 的视觉编码器现已接入同一线性探测 / LoRA 训练接口。新配置为 `configs/experiments_vlm.json`，复用既有患者划分，结果独立保存到 `runs/foundation_sft_vlm`。新训练同时记录验证损失并保存训练曲线；操作步骤、官方权重入口及离线更新方法见 [FOUNDATION_VLM_SETUP.md](FOUNDATION_VLM_SETUP.md)。

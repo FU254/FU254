@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import nullcontext
+from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import math
@@ -23,7 +24,7 @@ from .data import CXRDataset, build_cohort
 from .metrics import (aggregate_patient_predictions, binary_metrics,
                       save_evaluation, select_threshold)
 from .models import build_adapter
-from .models.common import FoundationClassifier
+from .models.common import FoundationClassifier, sha256_file
 from .split import load_or_create_split
 
 
@@ -91,6 +92,8 @@ def prepare(config):
     split = load_or_create_split(cohort, config["split_manifest"],
                                  seed=config["split_seed"], ratios=config["split_ratios"])
     diagnostics = dict(cohort.attrs.get("cohort_diagnostics", {}))
+    if cohort.attrs.get("cohort_cache_hit"):
+        print("[prepare] Reused cached workbook/DICOM header matching.", flush=True)
     diagnostics["splits"] = {
         name: {"images": int((split["split"] == name).sum()),
                "patients": int(split.loc[split["split"] == name, "patient_id"].nunique()),
@@ -112,19 +115,26 @@ def _loader(split, name, adapter, config, generator=None):
     dataset = CXRDataset(split.loc[split["split"] == name], adapter.preprocess,
                          training=name == "train", seed=config["seed"],
                          horizontal_flip_probability=train["horizontal_flip_probability"],
-                         rotation_degrees=train["rotation_degrees"])
+                         rotation_degrees=train["rotation_degrees"], cache_dir=config.get("cache_dir"))
     return DataLoader(dataset, batch_size=train["batch_size"], shuffle=name == "train",
                       num_workers=train["num_workers"], drop_last=False,
                       pin_memory=str(config["device"]).startswith("cuda"),
                       worker_init_fn=_seed_worker, generator=generator)
 
 
-def predict(model, loader, device):
+def predict(model, loader, device, *, criterion=None):
     model.eval()
     rows = []
+    total_loss, total_images = 0.0, 0
     with torch.no_grad():
         for batch in loader:
             logits = model(batch["image"].to(device, non_blocking=True))
+            if criterion is not None:
+                loss = criterion(logits, batch["label"].to(device, non_blocking=True))
+                if not torch.isfinite(loss).item():
+                    raise RuntimeError("Non-finite validation loss")
+                total_loss += loss.item() * len(batch["label"])
+                total_images += len(batch["label"])
             probabilities = logits.sigmoid().cpu().numpy()
             if not np.isfinite(probabilities).all():
                 raise RuntimeError("Non-finite validation/test predictions")
@@ -132,13 +142,21 @@ def predict(model, loader, device):
                     batch["sample_id"], batch["patient_id"], batch["label"].numpy(), probabilities):
                 rows.append({"sample_id": sample, "patient_id": patient,
                              "label": int(label), "probability": float(probability)})
-    return pd.DataFrame(rows)
+    predictions = pd.DataFrame(rows)
+    if criterion is not None:
+        if not total_images:
+            raise ValueError("Validation loader contains no images")
+        return predictions, total_loss / total_images
+    return predictions
 
 
 def _train_epoch(model, loader, optimizer, criterion, device, train, scaler):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     total_loss, total_images, window_images = 0.0, 0, 0
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    optimizer_steps, overflow_windows, consecutive_overflows = 0, 0, 0
+    window_denominator = None
     amp = bool(train["amp"] and device.type == "cuda")
     for index, batch in enumerate(loader):
         images = batch["image"].to(device, non_blocking=True)
@@ -149,24 +167,55 @@ def _train_epoch(model, loader, optimizer, criterion, device, train, scaler):
         if not torch.isfinite(loss).item():
             raise RuntimeError("Non-finite training loss")
         count = len(labels)
-        # Sum sample losses before accumulation, then normalize once by the
-        # actual window size: the final short batch/window has the right weight.
-        scaler.scale(loss * count).backward()
+        if window_images == 0:
+            window_denominator = count * train["accumulation_steps"]
+        # Normalize before loss scaling so half-precision backward does not
+        # carry the summed window loss. Keep one denominator for this window;
+        # correct short/unequal batches once its actual sample count is known.
+        scaler.scale(loss * (count / window_denominator)).backward()
         window_images += count
         total_images += count
         total_loss += loss.detach().item() * count
         end_window = (index + 1) % train["accumulation_steps"] == 0 or index + 1 == len(loader)
         if end_window:
             scaler.unscale_(optimizer)
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.div_(window_images)
-            nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
-                                    train["gradient_clip"], error_if_nonfinite=True)
+            gradients = [p.grad for p in parameters if p.grad is not None]
+            if not gradients:
+                raise RuntimeError("No trainable gradients in this accumulation window")
+            finite_gradients = torch.stack([torch.isfinite(g).all() for g in gradients]).all().item()
+            if not finite_gradients and not scaler.is_enabled():
+                raise RuntimeError("Non-finite training gradients with AMP disabled")
+            if finite_gradients:
+                for gradient in gradients:
+                    gradient.mul_(window_denominator / window_images)
+                # A non-finite total norm with finite gradient entries remains
+                # an error; this also guards overflow from normalization after
+                # GradScaler has already recorded the unscaled gradients.
+                nn.utils.clip_grad_norm_(parameters, train["gradient_clip"], error_if_nonfinite=True)
+            old_scale = scaler.get_scale() if not finite_gradients else None
+            # unscale_ records overflowing gradients. GradScaler must see them
+            # before clipping: it skips the update and lowers the loss scale.
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             window_images = 0
+            if finite_gradients:
+                optimizer_steps += 1
+                consecutive_overflows = 0
+            else:
+                overflow_windows += 1
+                consecutive_overflows += 1
+                new_scale = scaler.get_scale()
+                if not new_scale < old_scale:
+                    raise RuntimeError("AMP did not back off after non-finite training gradients")
+                print(f"[amp] Skipped overflowing accumulation window {overflow_windows}; "
+                      f"loss_scale={old_scale:g}->{new_scale:g}", flush=True)
+                if consecutive_overflows >= 16:
+                    raise RuntimeError("AMP gradients overflowed for 16 consecutive accumulation windows. "
+                                       "Check full-precision training before continuing.")
+    if optimizer_steps == 0:
+        raise RuntimeError("No optimizer updates completed in this epoch. "
+                           "Check full-precision training before continuing.")
     return total_loss / total_images
 
 
@@ -220,7 +269,12 @@ def _new_run(config, suffix=""):
     return path
 
 
-def run_training(config, adapter=None, resume=None):
+def run_training(config, adapter=None, resume=None, *, resume_full_precision=False):
+    if resume_full_precision and not resume:
+        raise ValueError("--resume-full-precision requires --resume with an AMP-enabled last.pt")
+    if resume_full_precision:
+        config = deepcopy(config)
+        config["training"]["amp"] = False
     set_seed(config["seed"])
     split = prepare(config)
     cohort_hash = _split_hash(split)
@@ -245,19 +299,45 @@ def run_training(config, adapter=None, resume=None):
     criterion = FocalLoss(train["focal_gamma"], train["focal_scale"])
     start_epoch, best_auc, bad_epochs, best_model = 0, -math.inf, 0, None
     history = []
+    resume_provenance = None
     if resume:
         previous = _load_checkpoint(resume, model, config, cohort_hash)
-        if previous["config"]["training"] != train or previous["config"]["seed"] != config["seed"]:
+        expected_training = deepcopy(previous["config"]["training"])
+        if resume_full_precision:
+            if expected_training.get("amp") is not True:
+                raise ValueError("--resume-full-precision requires an AMP-enabled checkpoint; "
+                                 "use ordinary --resume for an FP32 checkpoint")
+            expected_training["amp"] = False
+            if any(not torch.isfinite(parameter).all().item()
+                   for parameter in model.parameters() if parameter.requires_grad):
+                raise ValueError("Cannot recover non-finite checkpoint parameters by changing precision")
+        if expected_training != train or previous["config"]["seed"] != config["seed"]:
             raise ValueError("Resume requires the same training settings and seed")
         optimizer.load_state_dict(previous["optimizer"])
         scheduler.load_state_dict(previous["scheduler"])
-        scaler.load_state_dict(previous["scaler"])
+        if not resume_full_precision:
+            scaler.load_state_dict(previous["scaler"])
         start_epoch = previous["epoch"] + 1
         best_auc, bad_epochs = previous["best_auc"], previous["bad_epochs"]
         best_model, history = previous["best_model"], previous["history"]
         _restore_rng(previous["rng"], generator)
+        resume_provenance = {
+            "checkpoint": str(Path(resume).expanduser().resolve()),
+            "checkpoint_sha256": sha256_file(resume),
+            "epochs_completed_before_resume": start_epoch,
+            "next_epoch": start_epoch + 1,
+            "source_amp": previous["config"]["training"]["amp"],
+            "target_amp": train["amp"],
+            "precision_changed": bool(resume_full_precision),
+            "history_before_resume_uses_source_precision": True,
+        }
     run = _new_run(config)
     _json(run / "config.json", config)
+    if resume_provenance is not None:
+        _json(run / "resume.json", resume_provenance)
+        if resume_full_precision:
+            print(f"[resume] Continuing after {start_epoch} completed epochs in FP32; "
+                  "optimizer, scheduler, RNG and prior best/history are retained.", flush=True)
     _json(run / "model_metadata.json", model.training_metadata())
     _json(run / "environment.json", {"torch": str(torch.__version__), "cuda_build": torch.version.cuda,
                                      "device": str(device), "cohort_hash": cohort_hash,
@@ -267,7 +347,7 @@ def run_training(config, adapter=None, resume=None):
     print(f"Run directory: {run.resolve()}", flush=True)
     for epoch in range(start_epoch, train["epochs"]):
         loss = _train_epoch(model, train_loader, optimizer, criterion, device, train, scaler)
-        validation = predict(model, val_loader, device)
+        validation, val_loss = predict(model, val_loader, device, criterion=criterion)
         patient_validation = aggregate_patient_predictions(validation)
         metrics = binary_metrics(patient_validation.label, patient_validation.probability)
         val_auc = metrics["roc_auc"]
@@ -278,7 +358,8 @@ def run_training(config, adapter=None, resume=None):
             best_model = {name: tensor.clone() for name, tensor in model.trainable_state_dict().items()}
         else:
             bad_epochs += 1
-        history.append({"epoch": epoch + 1, "train_loss": loss, "val_patient_roc_auc": val_auc,
+        history.append({"epoch": epoch + 1, "train_loss": loss, "val_loss": val_loss,
+                        "val_patient_roc_auc": val_auc,
                         "val_patient_pr_auc": metrics["pr_auc"],
                         "learning_rates": [group["lr"] for group in optimizer.param_groups]})
         print(json.dumps(history[-1]), flush=True)
@@ -294,6 +375,8 @@ def run_training(config, adapter=None, resume=None):
             break
     if best_model is None:
         raise RuntimeError("No best checkpoint was produced")
+    from .training_history import save_history_plots
+    save_history_plots(history, run)
     model.load_trainable_state_dict(best_model)
     validation = predict(model, val_loader, device)
     patients = aggregate_patient_predictions(validation)
@@ -418,10 +501,18 @@ def main(argv=None):
     parser.add_argument("--seed", type=int)
     parser.add_argument("--checkpoint", help="Trained best.pt for evaluation")
     parser.add_argument("--resume", help="last.pt to resume with identical training settings")
+    parser.add_argument("--resume-full-precision", action="store_true",
+                        help="Explicitly resume an AMP checkpoint in FP32; all other settings stay fixed")
     parser.add_argument("--result-json", help="Write a machine-readable success receipt for workflow automation")
     parser.add_argument("--audit-output", help="Fresh directory for a full frozen-split pixel audit")
+    parser.add_argument("--cache-dir", help="Optional private cache for matching, audits and resized images")
+    parser.add_argument("--force-audit", action="store_true", default=None,
+                        help="Decode every image again even when a successful audit is cached")
     args = parser.parse_args(argv)
-    config = load_config(args.config, {"device": args.device, "mode": args.mode, "seed": args.seed})
+    if args.resume_full_precision and (args.action != "train" or not args.resume):
+        parser.error("--resume-full-precision requires --action train and --resume")
+    config = load_config(args.config, {"device": args.device, "mode": args.mode, "seed": args.seed,
+                                     "cache_dir": args.cache_dir, "force_audit": args.force_audit})
     if args.action == "prepare":
         result = prepare(config)
         receipt = {"cohort_hash": _split_hash(result)}
@@ -430,10 +521,11 @@ def main(argv=None):
         split = prepare(config)
         output = (Path(args.audit_output).expanduser().resolve() if args.audit_output
                   else _new_run(config, "_data_audit") / "audit")
-        result = audit_split(split, output)
+        result = audit_split(split, output, cache_dir=config.get("cache_dir"),
+                             force=config.get("force_audit", False))
         receipt = {"cohort_hash": _split_hash(split), "audit_passed": result["audit_passed"],
                    "checked_images": result["checked_images"], "failed_images": result["failed_images"],
-                   "audit_output": str(output)}
+                   "audit_output": str(output), "audit_cached": result.get("audit_cached", False)}
         print(json.dumps({**receipt, "example_failures": result["failures"][:3]},
                          ensure_ascii=False, indent=2), flush=True)
     elif args.action == "smoke":
@@ -445,7 +537,8 @@ def main(argv=None):
         result = evaluate(config, args.checkpoint)
         receipt = {"run_dir": str(result.resolve())}
     else:
-        result = run_training(config, resume=args.resume)
+        result = run_training(config, resume=args.resume,
+                              resume_full_precision=args.resume_full_precision)
         receipt = {"run_dir": str(result.resolve())}
     if args.result_json:
         _json(args.result_json, {"action": args.action, "model": config["model"],

@@ -304,6 +304,199 @@ class _NumericCheckpointUnpickler(pickle._Unpickler):
         dispatch[opcode[0]] = reject_object_opcode
 
 
+class _InertOmegaConfNode:
+    """Data-only stand-in: OmegaConf constructors/resolvers are never imported."""
+
+    __slots__ = ("state",)
+
+
+_OMEGACONF_NODE_KINDS = {
+    "omegaconf.listconfig.ListConfig": "list",
+    "omegaconf.dictconfig.DictConfig": "dict",
+    "omegaconf.nodes.AnyNode": "scalar",
+    "omegaconf.nodes.StringNode": "scalar",
+    "omegaconf.nodes.IntegerNode": "scalar",
+    "omegaconf.nodes.FloatNode": "scalar",
+    "omegaconf.nodes.BooleanNode": "scalar",
+    "omegaconf.base.Metadata": "metadata",
+    "omegaconf.base.ContainerMetadata": "container_metadata",
+}
+_OMEGACONF_NODE_CLASSES = {
+    name: type("_Inert" + name.rsplit(".", 1)[1], (_InertOmegaConfNode,),
+               {"__slots__": (), "kind": kind})
+    for name, kind in _OMEGACONF_NODE_KINDS.items()
+}
+
+
+@dataclass(frozen=True)
+class _OmegaConfTypeToken:
+    name: str
+
+
+_OMEGACONF_TYPE_TOKENS = {
+    name: _OmegaConfTypeToken(name)
+    for name in ("dict", "list", "tuple", "str", "bytes", "int", "float", "bool", "Any", "Dict", "List")
+}
+
+
+def _checkpoint_resolver_cache(factory=None):
+    # OmegaConf serializes resolver_cache as defaultdict(dict). Keep only its
+    # inert dictionary data; neither an arbitrary factory nor a resolver runs.
+    if factory is not None and factory is not _OMEGACONF_TYPE_TOKENS["dict"]:
+        raise pickle.UnpicklingError("Unsupported OmegaConf resolver-cache factory")
+    return {}
+
+
+def _omegaconf_checkpoint_globals():
+    allowed = dict(_OMEGACONF_NODE_CLASSES)
+    for name in ("dict", "list", "tuple", "str", "bytes", "int", "float", "bool"):
+        allowed["builtins." + name] = _OMEGACONF_TYPE_TOKENS[name]
+        allowed["__builtin__." + name] = _OMEGACONF_TYPE_TOKENS[name]
+    allowed["__builtin__.long"] = _OMEGACONF_TYPE_TOKENS["int"]
+    for name in ("Any", "Dict", "List"):
+        allowed["typing." + name] = _OMEGACONF_TYPE_TOKENS[name]
+    allowed["collections.defaultdict"] = _checkpoint_resolver_cache
+    return allowed
+
+
+def _valid_omegaconf_state(instance, state):
+    if not isinstance(state, dict):
+        return False
+    kind = instance.kind
+    if kind in {"metadata", "container_metadata"}:
+        required = {"ref_type", "object_type", "optional", "key", "flags", "flags_root", "resolver_cache"}
+        if kind == "container_metadata":
+            required.update(("key_type", "element_type"))
+        if set(state) != required or not isinstance(state["optional"], bool) or not isinstance(state["flags_root"], bool):
+            return False
+        for name in ("ref_type", "object_type", "key_type", "element_type"):
+            if name in state and state[name] is not None and not isinstance(state[name], _OmegaConfTypeToken):
+                return False
+        flags = state["flags"]
+        if flags is not None and (not isinstance(flags, dict) or any(
+                not isinstance(key, str) or not isinstance(value, bool) for key, value in flags.items())):
+            return False
+        return (state["key"] is None or isinstance(state["key"], (str, int, float, bool))) and isinstance(state["resolver_cache"], dict)
+    required = {"_metadata", "_parent", "_content" if kind in {"list", "dict"} else "_val"}
+    if not required.issubset(state) or set(state).difference(required | {"_flags_cache"}):
+        return False
+    metadata = state["_metadata"]
+    if not isinstance(metadata, _InertOmegaConfNode) or metadata.kind not in {"metadata", "container_metadata"}:
+        return False
+    parent = state["_parent"]
+    if parent is not None and (not isinstance(parent, _InertOmegaConfNode) or parent.kind not in {"list", "dict"}):
+        return False
+    cache = state.get("_flags_cache")
+    if cache is not None and (not isinstance(cache, dict) or any(
+            not isinstance(key, str) or value is not None and not isinstance(value, bool) for key, value in cache.items())):
+        return False
+    if kind == "scalar":
+        return state["_val"] is None or isinstance(state["_val"], (str, bytes, bool, int, float))
+    content = state["_content"]
+    if content is None:
+        return True
+    if kind == "list":
+        return isinstance(content, list) and all(isinstance(item, _InertOmegaConfNode) for item in content)
+    return isinstance(content, dict) and all(
+        isinstance(key, (str, bytes, bool, int, float)) and isinstance(value, _InertOmegaConfNode)
+        for key, value in content.items()
+    )
+
+
+class _OmegaConfCheckpointUnpickler(_NumericCheckpointUnpickler):
+    """Restricted tensor loading with inert OmegaConf 2.3 metadata support.
+
+    Only the reviewed container/scalar-node layouts are accepted. NEWOBJ does
+    not call OmegaConf code, BUILD stores validated data in one local slot, and
+    REDUCE cannot call metadata types or arbitrary resolver/cache factories.
+    """
+
+    dispatch = _NumericCheckpointUnpickler.dispatch.copy()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reconstruction_functions = tuple(self.allowed_globals.values()) + (_checkpoint_resolver_cache,)
+        self.allowed_globals.update(_omegaconf_checkpoint_globals())
+
+    def load_newobj(self):
+        arguments = self.stack.pop()
+        cls = self.stack.pop()
+        if arguments != () or not any(cls is allowed for allowed in _OMEGACONF_NODE_CLASSES.values()):
+            raise pickle.UnpicklingError("Unsupported checkpoint metadata constructor")
+        self.append(object.__new__(cls))
+
+    def load_reduce(self):
+        arguments = self.stack.pop()
+        function = self.stack[-1]
+        if not isinstance(arguments, tuple) or not any(function is allowed for allowed in self.reconstruction_functions):
+            raise pickle.UnpicklingError("Unrecognized checkpoint reconstruction function")
+        self.stack[-1] = function(*arguments)
+
+    def load_build(self):
+        if isinstance(self.stack[-2], _InertOmegaConfNode):
+            state = self.stack.pop()
+            instance = self.stack[-1]
+            if not _valid_omegaconf_state(instance, state):
+                raise pickle.UnpicklingError("Unsupported OmegaConf checkpoint metadata state")
+            instance.state = state
+        else:
+            super().load_build()
+
+    dispatch[pickle.NEWOBJ[0]] = load_newobj
+    dispatch[pickle.REDUCE[0]] = load_reduce
+    dispatch[pickle.BUILD[0]] = load_build
+
+
+def _plain_omegaconf_metadata(payload):
+    """Discard parent/type/flag metadata; read values without interpolation."""
+    memo, active = {}, set()
+
+    def plain(value):
+        if isinstance(value, _InertOmegaConfNode):
+            if value.kind not in {"dict", "list", "scalar"} or not hasattr(value, "state"):
+                raise pickle.UnpicklingError("OmegaConf checkpoint metadata is not a data value")
+            if value.kind == "scalar":
+                # In particular, preserve '${...}' literally. No resolver,
+                # environment lookup, import, or interpolation is evaluated.
+                return value.state["_val"]
+            return plain(value.state["_content"])
+        if isinstance(value, _OmegaConfTypeToken):
+            raise pickle.UnpicklingError("OmegaConf type metadata cannot be a configuration value")
+        if type(value) not in (dict, OrderedDict, list, tuple, set):
+            return value
+        identity = id(value)
+        if identity in active:
+            raise pickle.UnpicklingError("Cyclic checkpoint configuration values are unsupported")
+        if identity in memo:
+            return memo[identity]
+        active.add(identity)
+        if isinstance(value, dict):
+            result = OrderedDict() if type(value) is OrderedDict else {}
+            for key, item in value.items():
+                result[key] = plain(item)
+            if type(value) is OrderedDict:
+                result.__dict__.update({key: plain(item) for key, item in value.__dict__.items()})
+        else:
+            items = [plain(item) for item in value]
+            result = tuple(items) if type(value) is tuple else set(items) if type(value) is set else items
+        active.remove(identity)
+        memo[identity] = result
+        return result
+
+    return plain(payload)
+
+
+def _load_omegaconf_checkpoint(path):
+    if not zipfile.is_zipfile(path):
+        raise pickle.UnpicklingError("OmegaConf metadata compatibility requires a Torch ZIP checkpoint")
+    restricted_pickle = SimpleNamespace(
+        __name__="foundation_omegaconf_checkpoint_pickle", Unpickler=_OmegaConfCheckpointUnpickler,
+    )
+    # This selects only our restricted, inert parser, never arbitrary pickle.
+    payload = torch.load(path, map_location="cpu", weights_only=False, pickle_module=restricted_pickle)
+    return _plain_omegaconf_metadata(payload)
+
+
 def _load_numeric_checkpoint(path):
     # Restrict compatibility loading to Torch ZIP checkpoints. The obsolete tar
     # loader extracts members and is unnecessary for the EVA-X release format.
@@ -317,25 +510,42 @@ def _load_numeric_checkpoint(path):
     return torch.load(path, map_location="cpu", weights_only=False, pickle_module=restricted_pickle)
 
 
-def load_checkpoint(path, state_key=None):
+def load_checkpoint_payload(path, *, allow_omegaconf_metadata=False):
+    """Load local tensor/plain-metadata payload without selecting its state dict."""
+    if not isinstance(allow_omegaconf_metadata, bool):
+        raise ValueError("allow_omegaconf_metadata must be a boolean")
     path = Path(path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Pretrained checkpoint not found: {path}")
-    try:
-        state = torch.load(path, map_location="cpu", weights_only=True)
-    except pickle.UnpicklingError as error:
-        # Older training checkpoints save NumPy metrics and ordinary set
-        # metadata outside the tensor state dict. PyTorch 2.0 has no local
-        # safe_globals context. Its weights-only loader also lacks protocol-4
-        # FRAME (149) support; handle only these known restrictions, never an
-        # arbitrary unknown application class or corrupt checkpoint.
-        message = str(error)
-        metadata_globals = ("numpy.core.multiarray.scalar", "numpy._core.multiarray.scalar", "numpy.dtype",
-                            "__builtin__.set", "builtins.set")
-        unsupported_frame = "Unsupported operand 149" in message
-        if not any(name in message for name in metadata_globals) and not unsupported_frame:
-            raise
-        state = _load_numeric_checkpoint(path)
+    if allow_omegaconf_metadata:
+        # CXR-CLIP stores config after model/optimizer tensors. Going directly
+        # to its inert parser avoids loading the large weights twice before
+        # discovering ListConfig. It also never consults process-wide user
+        # safe_globals for OmegaConf classes.
+        state = _load_omegaconf_checkpoint(path)
+    else:
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=True)
+        except pickle.UnpicklingError as error:
+            # Older training checkpoints save NumPy metrics and ordinary set
+            # metadata outside the tensor state dict. PyTorch 2.0 has no local
+            # safe_globals context. Its weights-only loader also lacks protocol-4
+            # FRAME (149) support; handle only these known restrictions, never an
+            # arbitrary unknown application class or corrupt checkpoint.
+            message = str(error)
+            metadata_globals = ("numpy.core.multiarray.scalar", "numpy._core.multiarray.scalar", "numpy.dtype",
+                                "__builtin__.set", "builtins.set")
+            unsupported_frame = "Unsupported operand 149" in message
+            if not any(name in message for name in metadata_globals) and not unsupported_frame:
+                raise
+            state = _load_numeric_checkpoint(path)
+    if not isinstance(state, dict) or not state:
+        raise ValueError("Checkpoint payload must be a nonempty dictionary")
+    return state
+
+
+def load_checkpoint(path, state_key=None):
+    state = load_checkpoint_payload(path)
     if state_key:
         for part in state_key.split("."):
             state = state[part]

@@ -311,8 +311,16 @@ def main(argv=None):
     parser.add_argument("--max-parallel", type=int, default=5)
     parser.add_argument("--plan", action="store_true", help="Show resolved jobs without executing or writing files")
     parser.add_argument("--check-only", action="store_true", help="Prepare and audit all data, then smoke all models; do not train")
+    parser.add_argument("--cache-dir", help="Optional shared private cache for data preparation and image reads")
+    parser.add_argument("--force-audit", action="store_true",
+                        help="Repeat full pixel audits even if successful results are cached")
     args = parser.parse_args(argv)
     plan = build_plan(args.config, args.models, args.modes, args.seeds)
+    for job in plan["jobs"]:
+        if args.cache_dir:
+            job["config"]["cache_dir"] = str(Path(args.cache_dir).expanduser().resolve())
+        if args.force_audit:
+            job["config"]["force_audit"] = True
     if args.plan:
         for job in plan["jobs"]:
             print(f"{job['id']}  environment={job['env']}  device={job['device']}")
