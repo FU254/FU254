@@ -1,0 +1,5 @@
+{
+  "base_config": "common_cnn.json",
+  "model": "densenet121_cxr",
+  "checkpoint": "foundation_weights/densenet121_cxr/nih-pc-chex-mimic_ch-google-openi-kaggle-densenet121-d121-tw-lr001-rot45-tr15-sc15-seed0-best.pt"
+}

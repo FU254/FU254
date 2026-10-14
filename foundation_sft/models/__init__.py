@@ -1,11 +1,15 @@
 """Model imports are lazy so each encoder can use its own supported environment."""
 
 SUPPORTED_MODELS = ("eva_x", "rad_dino", "ray_dino", "chexfound", "cxformer", "radjepa",
-                    "cxr_clip", "xray_siglip", "biomedclip", "chexzero")
+                    "cxr_clip", "xray_siglip", "biomedclip", "chexzero",
+                    "densenet121_imagenet", "densenet121_cxr", "resnet18_cxr")
 
 
 def build_adapter(config):
     name = config["model"]
+    if name in {"densenet121_imagenet", "densenet121_cxr", "resnet18_cxr"}:
+        from .cnn import build_cnn
+        return build_cnn(config)
     if name == "eva_x":
         from .eva_x import build_eva_x
         return build_eva_x(config)

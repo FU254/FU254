@@ -1,8 +1,23 @@
-# 项目交接：五个胸片基础模型的完整实验
+# 项目交接：胸片模型实验与 CNN 基线
 
-更新日期：2026-10-12。本文用于新对话或新任务接续工作；详细使用说明见 [README.md](README.md)，权重与源码来源见 [MODEL_SOURCES.md](MODEL_SOURCES.md)。
+更新日期：2026-10-14。本文用于新对话或新任务接续工作；详细使用说明见 [README.md](README.md)，权重与源码来源见 [MODEL_SOURCES.md](MODEL_SOURCES.md)。
 
-**当前关键结论：五个模型的两种训练方式已全部通过服务器 GPU smoke，正式训练被不完整的 DICOM 阻断。下一步是检查全部影像，并验证原图副本能否恢复损坏文件。**
+**当前任务：新增三个 CNN，仅训练分类头。代码和云端验证已完成；尚未上传用户服务器，三份权重需在联网电脑下载并上传，再进行服务器检查。**
+
+## 0. 最新进度与下一步
+
+- 用户现有模型范围为 EVA-X、RAD-DINO、CXformer、CheXFound、RadJEPA、XraySigLIP、BiomedCLIP、CheXzero；代码仍兼容 CXR-CLIP。不要把所有权重目录都解释成已完成实验。
+- 用户已打印五个基础模型两模式的结果：`suite_20261013T024024Z_92ac596d` 中 9 项完成，CXformer LoRA 因非有限损失失败。已有 FP32 恢复工具，但未收到恢复后的完成证据。
+- XraySigLIP 的线性探测和 LoRA 已由服务器日志确认完成：`runs/foundation_sft_vlm/suites/suite_20261013T114034Z_19e8e5d5`。其他 VLM 的完成状态仍需查看实际结果。
+- 新增 `densenet121_imagenet`（torchvision ImageNet）、`densenet121_cxr`（TorchXRayVision 多胸片数据集监督预训练）、`resnet18_cxr`（Stanford MoCo-CXR/CheXpert 自监督）。用户确认三项只训练分类头；没有下载其权重。torchvision 自带的权重属于 ImageNet，不能替代医学预训练权重。
+- CNN 套件为 `foundation_sft/configs/experiments_cnn.json`，只有 `linear_probe`，FP32、种子 42、默认 GPU 0/1/2。冻结编码器及 BatchNorm；DenseNet 分类头可训练参数 1025，ResNet 分类头 513。数据/标签/划分及训练设置继承用户当前 `common.json`，保留用户已有缓存和恢复后的清单路径。
+- 使用 `download_cnn_weights.py` 在联网电脑下载，再用 PyCharm 上传到服务器三个新增权重目录；代码使用 `update_foundation_cnn.py` 做带备份的增量安装。指南见 [CNN_BASELINES.md](CNN_BASELINES.md)。代码分支：[`codex/cnn-linear-baselines`](https://github.com/FU254/FU254/tree/codex/cnn-linear-baselines)。
+- 云端已核对两份 DenseNet 官方实物的 SHA-256，验证加载、仅更新分类头、编码器/BN 不变。MoCo-CXR 官方来源和架构已核实，但云端访问 Google Storage 返回 403，真实检查点未取得；其软件验证使用合成 MoCo 权重，不能称为真实医学权重验证。
+- 两套 CPU 环境（Torch 2.9.1 与用户相同版本的 Torch 2.0.1）各运行 368 项 unittest，无失败，分别跳过 16/21 项可选依赖或上游模型检查。另用合成 DICOM、两份真实 DenseNet 权重与一份合成 MoCo 权重完成三项 prepare、全量审核、smoke、两轮训练、自动测试及比较报告。
+- 下一步在服务器运行 CNN `--check-only`，全部通过后正式运行。新结果保存到 `runs/foundation_sft_cnn`；现有 `show_foundation_results.py` 默认扫描可包含 CNN，显式指定 `--models` 时添加三个新 ID。
+- GitHub 提交不等于已上传服务器。不要声称已替用户连接校园网服务器、下载其电脑文件或启动正式 CNN 训练。
+
+以下第 1–6 节保留 2026-10-12 的历史记录；训练状态与当前工作以本节为准。
 
 ## 1. 工作方式与目标
 

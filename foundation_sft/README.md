@@ -431,3 +431,7 @@ MPLBACKEND=Agg OMP_NUM_THREADS=2 python -m unittest discover -s tests -p 'test_*
 ## 新增四个视觉语言模型
 
 CXR-CLIP、XraySigLIP、BiomedCLIP 和 CheXzero 的视觉编码器现已接入同一线性探测 / LoRA 训练接口。新配置为 `configs/experiments_vlm.json`，复用既有患者划分，结果独立保存到 `runs/foundation_sft_vlm`。新训练同时记录验证损失并保存训练曲线；操作步骤、官方权重入口及离线更新方法见 [FOUNDATION_VLM_SETUP.md](FOUNDATION_VLM_SETUP.md)。
+
+## 新增三个 CNN 线性探测基线
+
+新增 torchvision ImageNet DenseNet121、TorchXRayVision 胸片监督预训练 DenseNet121 和 Stanford MoCo-CXR 胸片自监督预训练 ResNet18。三项均冻结编码器，只训练一个线性二分类头（`linear_probe`），使用 FP32，复用服务器现有 `common.json` 和共同患者划分；新套件为 `configs/experiments_cnn.json`，结果独立保存到 `runs/foundation_sft_cnn`。权重下载、保留原配置的增量安装、运行命令及预处理差异见 [CNN_BASELINES.md](CNN_BASELINES.md)。

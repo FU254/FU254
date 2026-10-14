@@ -1,0 +1,11 @@
+{
+  "modes": ["linear_probe"],
+  "seeds": [42],
+  "suite_root": "runs/foundation_sft_cnn/suites",
+  "conda_executable": "/opt/anaconda3/bin/conda",
+  "jobs": [
+    {"model": "densenet121_imagenet", "config": "foundation_sft/configs/densenet121_imagenet.json", "env": "evax_lora", "device": "cuda:0"},
+    {"model": "densenet121_cxr", "config": "foundation_sft/configs/densenet121_cxr.json", "env": "evax_lora", "device": "cuda:1"},
+    {"model": "resnet18_cxr", "config": "foundation_sft/configs/resnet18_cxr.json", "env": "evax_lora", "device": "cuda:2"}
+  ]
+}

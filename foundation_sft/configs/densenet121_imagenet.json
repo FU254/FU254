@@ -1,0 +1,5 @@
+{
+  "base_config": "common_cnn.json",
+  "model": "densenet121_imagenet",
+  "checkpoint": "foundation_weights/densenet121_imagenet/densenet121-a639ec97.pth"
+}

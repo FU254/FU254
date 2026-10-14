@@ -1,0 +1,6 @@
+{
+  "base_config": "common.json",
+  "mode": "linear_probe",
+  "output_root": "runs/foundation_sft_cnn",
+  "training": {"amp": false}
+}
