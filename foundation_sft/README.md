@@ -437,3 +437,5 @@ CXR-CLIP、XraySigLIP、BiomedCLIP 和 CheXzero 的视觉编码器现已接入�
 新增 torchvision ImageNet DenseNet121、TorchXRayVision 胸片监督预训练 DenseNet121 和 Stanford MoCo-CXR 胸片自监督预训练 ResNet18。三项均冻结编码器，只训练一个线性二分类头（`linear_probe`），使用 FP32，复用服务器现有 `common.json` 和共同患者划分；新套件为 `configs/experiments_cnn.json`，结果独立保存到 `runs/foundation_sft_cnn`。权重下载、保留原配置的增量安装、运行命令及预处理差异见 [CNN_BASELINES.md](CNN_BASELINES.md)。
 
 若难以在 ZIP 中定位安装文件，可在联网电脑单独运行 [download_cnn_update.py](../download_cnn_update.py)：`python download_cnn_update.py --output cnn_update`。该脚本仅依赖 Python 标准库，从固定已发布版本下载并校验 12 个安装文件，自动创建 `cnn_update/`；已有不同内容的文件会保留并提示使用新的输出目录。完成后将整个目录通过 PyCharm 上传，再按安装说明运行目录中的 `update_foundation_cnn.py`。此步骤准备代码安装文件；三份模型权重继续保存在原 `foundation_weights/`。
+
+Windows 若出现 Python `SSL: UNEXPECTED_EOF_WHILE_READING`，更新此工具后运行 `python download_cnn_update.py --output cnn_update --transport powershell`，改用 Windows PowerShell 的 HTTPS 客户端。下载按文件顺序进行，连接中断最多重试三次；仍验证证书及固定 SHA-256，所有文件校验完成后才写入输出目录。
