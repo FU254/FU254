@@ -1,0 +1,12 @@
+{
+  "modes": ["linear_probe"],
+  "seeds": [42],
+  "suite_root": "runs/foundation_sft_vlm_extra/suites",
+  "conda_executable": "/opt/anaconda3/bin/conda",
+  "jobs": [
+    {"model": "cxr_clip", "config": "foundation_sft/configs/cxr_clip_extra.json", "env": "evax_lora", "device": "cuda:0"},
+    {"model": "mgca", "config": "foundation_sft/configs/mgca.json", "env": "evax_lora", "device": "cuda:1"},
+    {"model": "biovil_t", "config": "foundation_sft/configs/biovil_t.json", "env": "evax_lora", "device": "cuda:2"},
+    {"model": "medklip", "config": "foundation_sft/configs/medklip.json", "env": "evax_lora", "device": "cuda:3"}
+  ]
+}

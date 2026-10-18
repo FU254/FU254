@@ -1,0 +1,6 @@
+{
+  "base_config": "common_vlm_extra.json",
+  "model": "mgca",
+  "checkpoint": "foundation_weights/mgca/mgca_vit_base.ckpt",
+  "checkpoint_source": "HKU-MedAI/MGCA:vit_base"
+}

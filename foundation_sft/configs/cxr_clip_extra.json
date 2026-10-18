@@ -1,0 +1,5 @@
+{
+  "base_config": "cxr_clip.json",
+  "mode": "linear_probe",
+  "output_root": "runs/foundation_sft_vlm_extra"
+}

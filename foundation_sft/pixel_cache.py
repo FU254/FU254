@@ -33,7 +33,8 @@ def _resize_signature(preprocess):
     mode = _spec_value(preprocess, "resize_mode", "resize")
     equalize = _spec_value(preprocess, "do_hist_equalization", False)
     interpolation = _spec_value(preprocess, "interpolation", "bicubic")
-    if size < 1 or mode not in {"resize", "letterbox", "shortest_edge_center_crop", "chexzero_pad320"}:
+    if size < 1 or mode not in {"resize", "letterbox", "shortest_edge_center_crop", "chexzero_pad320",
+                               "mgca_pad256_center_crop", "biovil_center_crop"}:
         raise PixelCacheError("Invalid deterministic image resize configuration.")
     if interpolation not in {"nearest", "bilinear", "bicubic", "lanczos", "box", "hamming"}:
         raise PixelCacheError("Invalid deterministic image interpolation configuration.")
@@ -44,13 +45,25 @@ def _resize_signature(preprocess):
     edge = int(_spec_value(preprocess, "resize_shortest_edge") or size)
     if mode == "shortest_edge_center_crop" and edge < 1:
         raise PixelCacheError("Invalid deterministic image shortest edge configuration.")
+    extra = {}
+    if mode in {"mgca_pad256_center_crop", "biovil_center_crop"}:
+        if interpolation != "bilinear" or equalize:
+            raise PixelCacheError("Extra VLM preprocessing requires bilinear metadata and no histogram equalization.")
+        if mode == "mgca_pad256_center_crop":
+            if size != 224:
+                raise PixelCacheError("MGCA requires pad256/crop224 geometry.")
+            import cv2
+            extra["opencv_version"] = cv2.__version__
+        elif size != 448 or edge != 512:
+            raise PixelCacheError("BioViL-T requires resize512/crop448 geometry.")
     return {
         "image_size": size,
         "resize_mode": mode,
         # An unused edge must not prevent otherwise identical models sharing.
-        "resize_shortest_edge": edge if mode == "shortest_edge_center_crop" else None,
+        "resize_shortest_edge": edge if mode in {"shortest_edge_center_crop", "biovil_center_crop"} else None,
         "interpolation": interpolation,
         "do_hist_equalization": equalize,
+        **extra,
     }
 
 

@@ -1,12 +1,24 @@
 """Model imports are lazy so each encoder can use its own supported environment."""
 
+try:
+    from .extra_vlm_registry import EXTRA_MODELS
+except ModuleNotFoundError as error:
+    if error.name != __name__ + ".extra_vlm_registry":
+        raise
+    # Earlier scoped CNN/VLM installers also ship this lazy registry. They do
+    # not advertise additional encoders unless the complete new add-on exists.
+    EXTRA_MODELS = ()
+
 SUPPORTED_MODELS = ("eva_x", "rad_dino", "ray_dino", "chexfound", "cxformer", "radjepa",
                     "cxr_clip", "xray_siglip", "biomedclip", "chexzero",
-                    "densenet121_imagenet", "densenet121_cxr", "resnet18_cxr")
+                    "densenet121_imagenet", "densenet121_cxr", "resnet18_cxr") + EXTRA_MODELS
 
 
 def build_adapter(config):
     name = config["model"]
+    if name in EXTRA_MODELS:
+        from .extra_vlm_registry import build_extra_adapter
+        return build_extra_adapter(config)
     if name in {"densenet121_imagenet", "densenet121_cxr", "resnet18_cxr"}:
         from .cnn import build_cnn
         return build_cnn(config)

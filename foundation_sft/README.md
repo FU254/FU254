@@ -4,6 +4,8 @@
 
 提供 EVA-X、RAD-DINO、RayDINO、CheXFound、CXformer 和 RadJEPA 的统一入口。每个模型均支持真正的线性探测（`linear_probe`）以及注意力 LoRA 加分类头（`lora`），用于预测 Excel 中的“阻塞性通气障碍”。代码可以在本地 PyCharm 编辑，通过 SSH 解释器使用服务器的数据、权重和 GPU。
 
+新增 CXR-CLIP、MGCA、BioViL-T、MedKLIP 的独立实验批次、官方权重和增量安装步骤见 [EXTRA_VLM_SETUP.md](EXTRA_VLM_SETUP.md)。四模型先做线性探测，CXR-CLIP/MGCA 另做 LoRA；BioViL-T 的单图像分支和 MedKLIP 的知识解码器均保留明确的特征接口用于后续蒸馏。
+
 原 `LoRA-分类/base-1.py` 保留。新框架独立放在本目录，各模型通过适配器保留自己的输入尺寸、归一化和注意力结构。
 
 ## 先运行已有的 EVA-X

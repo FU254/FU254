@@ -1,0 +1,8 @@
+{
+  "base_config": "common_vlm_extra.json",
+  "model": "medklip",
+  "checkpoint": "foundation_weights/medklip/checkpoint_final.pth",
+  "checkpoint_source": "MediaBrain-SJTU/MedKLIP:resnet50",
+  "disease_book": "foundation_weights/medklip/observation_explanation.json",
+  "disease_embeddings": "foundation_weights/medklip/disease_book_embeddings.pt"
+}

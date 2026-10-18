@@ -136,3 +136,13 @@ python run_foundation_experiments.py
 - 结果目录为 `runs/foundation_sft/suites/suite_<时间>_<标识>/`。`suite.json` 记录状态与准确运行目录，`logs/` 保存报错，`data_audit/` 保存审核，`report/` 保存汇总 CSV 和患者 ROC/PR 图。RadJEPA 单次训练结果使用独立输出根目录。
 
 新对话可以发送：“请先阅读仓库 `foundation_sft/PROJECT_HANDOFF.md`，继续检查 DICOM 恢复和五模型实验”，并附上最新服务器终端输出。文档保存进度，但不会自动清空或缩短当前对话；新开对话后可据此接续。
+# 2026-10-18：新增胸片图文教师候选
+
+- 新增 MGCA ViT-B/16、BioViL-T、完整 MedKLIP 知识查询适配器，将已有 CXR-CLIP 组成独立批次。说明：`EXTRA_VLM_SETUP.md`。
+- `experiments_vlm_extra.json` 默认四组线性探测；`experiments_vlm_extra_lora.json` 只包含 CXR-CLIP 和 MGCA 的两组 LoRA。BioViL-T 单图像分支不执行时序注意力；MedKLIP 当前保留完整知识解码器但仅开放线性探测。
+- 共用原 `common.json` 和患者划分，新增输出 `runs/foundation_sft_vlm_extra`；仅新增两种确定性 resize/cache 路径，原图像处理和缓存键保持兼容。
+- 特征已接入 BackboneFeatures；MedKLIP 空间 memory 与 75 个语义查询分开，后者不能当空间网格。尚未实现多教师权重分配或学生蒸馏训练器。
+- `update_foundation_vlm_extra.py` 为有校验、备份和回滚的增量安装器；完整包可通过 `package_extra_vlm.py` 生成。官方权重来源及手动选择项由 `download_extra_vlm_weights.py` 列出。
+- MedKLIP 还需要官方知识 JSON 与本地 Bio_ClinicalBERT。`prepare_medklip_book.py` 一次性离线生成知识向量，保留 tokenizer 规范、知识顺序和文件 SHA256；不用患者文本，不允许随机向量替代。
+- 本地 Torch 2.0.1：393 项中 371 通过、22 跳过；Torch 2.9.1：新增 18 项全部通过。三种完整模型与固定官方源码进行合成 state/输出对照；完整合成 BERT 知识向量生成成功。实际 ZIP 在旧 checkout 安装/重装/六任务规划通过。
+- 尚未下载并验证新医学权重，未连接或上传用户 SSH 服务器。下一步按说明在 Windows 获取权重并上传，再运行新的 `--check-only`。用户原有 11 个模型与这些新增模型分开记录。

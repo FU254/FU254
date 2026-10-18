@@ -332,6 +332,9 @@ def _resize_image(pixels, preprocess):
     }
     if interpolation not in resamplers:
         raise ValueError("Unsupported image interpolation setting.")
+    if mode in {"mgca_pad256_center_crop", "biovil_center_crop"}:
+        from .extra_vlm_preprocessing import resize_extra
+        return resize_extra(pixels, preprocess)
     equalize = _spec_value(preprocess, "do_hist_equalization", False)
     if equalize:
         # The reviewed CXformer processor consumes uint8 input and resizes the

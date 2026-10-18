@@ -1,0 +1,4 @@
+# Keep evax_lora's Torch 2.0.1 / torchvision 0.15.2 / timm 0.4.12 /
+# transformers 4.48.3. No framework upgrades or hi-ml/text-tower install.
+# Only MGCA's original area-resize path needs OpenCV; an existing cv2 works.
+opencv-python-headless==4.10.0.84

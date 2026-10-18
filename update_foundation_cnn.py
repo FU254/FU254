@@ -22,11 +22,11 @@ PAYLOAD_SHA256 = {
     "foundation_sft/configs/experiments_cnn.json": "713372c22a29f093d991bdeda4c0f262260b96eb798bbf56b5c19458d5824f7f",
     "foundation_sft/CNN_BASELINES.md": "915fb2b5d3f29a860edcac877a877e577f6ec1a26bca6962c6d718902b84185a",
     "download_cnn_weights.py": "79f838018b2fd794e5f07462dcc7e4d7f145c1ff15152757ce86a61cbdc61eb6",
-    "foundation_sft/models/__init__.py": "0ac0c81fe27240eec7bebab955f7d26eba58917c3ec182671a845967f5b683a9"
+    "foundation_sft/models/__init__.py": "0d6fb7511c2b0f71c35225871513484c2b8a93200f77f81ff43daf67193e4008"
 }
 # Earlier releases before the restricted numeric checkpoint loader are not
 # compatible with this add-on. Accept the verified current main/VLM registries.
-PREVIOUS_REGISTRIES = {'7a4ee990697a1ca79eb7b1b7dcd7fced971092cec72b00b48d21a9cee45e9034', 'c7bdc7014861514bdbdaf41b6711007668511f902b380730ae81da47e5e40d29'}
+PREVIOUS_REGISTRIES = {'c7bdc7014861514bdbdaf41b6711007668511f902b380730ae81da47e5e40d29', '7a4ee990697a1ca79eb7b1b7dcd7fced971092cec72b00b48d21a9cee45e9034', '0ac0c81fe27240eec7bebab955f7d26eba58917c3ec182671a845967f5b683a9'}
 REGISTRY = "foundation_sft/models/__init__.py"
 
 

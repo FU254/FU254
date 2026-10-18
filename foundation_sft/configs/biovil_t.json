@@ -1,0 +1,7 @@
+{
+  "base_config": "common_vlm_extra.json",
+  "model": "biovil_t",
+  "checkpoint": "foundation_weights/biovil_t/biovil_t_image_model_proj_size_128.pt",
+  "checkpoint_source": "microsoft/BiomedVLP-BioViL-T:v1.0",
+  "training": {"batch_size": 4, "accumulation_steps": 16}
+}
