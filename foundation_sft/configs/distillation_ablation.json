@@ -1,0 +1,19 @@
+{
+  "template": "foundation_sft/configs/distillation_rad_dino_vit_tiny.json",
+  "output_root": "runs/distillation_ablation",
+  "seeds": [42, 43, 44],
+  "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+  "max_parallel": 4,
+  "reuse_suites": [
+    "runs/distillation_abcd/suites/suite_20261020T081023Z_ac300699",
+    "runs/single_teacher_distillation/suites/suite_20261019T110343Z_3b1acd96"
+  ],
+  "groups": {
+    "supervised": {"condition": "supervised", "soft_weight": 0.0, "global_weight": 0.0, "local_weight": 0.0},
+    "soft_only": {"condition": "distillation", "soft_weight": 0.5, "global_weight": 0.0, "local_weight": 0.0},
+    "no_local": {"condition": "distillation", "soft_weight": 0.5, "global_weight": 0.1, "local_weight": 0.0},
+    "no_global": {"condition": "distillation", "soft_weight": 0.5, "global_weight": 0.0, "local_weight": 1.0},
+    "no_soft": {"condition": "distillation", "soft_weight": 0.0, "global_weight": 0.1, "local_weight": 1.0},
+    "full_kd": {"condition": "distillation", "soft_weight": 0.5, "global_weight": 0.1, "local_weight": 1.0}
+  }
+}

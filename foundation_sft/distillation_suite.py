@@ -295,7 +295,7 @@ def verify_run(run, check, job, *, checkpoint_loader=None):
     return result
 
 
-def _reuse_candidates(suites, condition):
+def _reuse_candidates(suites, condition, seed=None, student_mode=None):
     for suite in suites:
         path = Path(suite)
         if not path.is_dir():
@@ -305,12 +305,31 @@ def _reuse_candidates(suites, condition):
         if manifest.is_file():
             try:
                 data = _read(manifest)
+                if isinstance(data.get("jobs"), dict):
+                    # Explicit coordinator batches may contain many seeds and
+                    # conditions. Preserve manifest order; never rank test scores.
+                    for record in data["jobs"].values():
+                        if record.get("status") not in {"completed", "reused", "resumed"}:
+                            continue
+                        job, receipt = record.get("job", {}), record.get("result", {})
+                        if (job.get("condition") != condition
+                                or (seed is not None and job.get("seed") != seed)
+                                or (student_mode is not None and job.get("student_mode") != student_mode)):
+                            continue
+                        if isinstance(receipt.get("run"), str) and receipt["run"]:
+                            run = Path(receipt["run"])
+                            yield run if run.is_absolute() else path / run
+                    continue
                 receipt = data.get("conditions", {}).get(condition, {})
             except (OSError, ValueError, TypeError, AttributeError):
                 # An interrupted historical manifest must not prevent a new
                 # experiment. The condition directory is verified independently.
                 receipt = {}
             if isinstance(receipt, dict) and isinstance(receipt.get("run"), str) and receipt["run"]:
+                if seed is not None and receipt.get("seed", seed) != seed:
+                    continue
+                if student_mode is not None and receipt.get("student_mode", "full_finetune") != student_mode:
+                    continue
                 run = Path(receipt["run"])
                 yield run if run.is_absolute() else path / run
                 continue
@@ -322,18 +341,19 @@ def run_suite(plan, *, check_only=False, resume_suite=None, launcher=None, verif
     launcher, verifier = launcher or _launch, verifier or verify_run
     project = Path(plan["project"])
     signature = protocol_hash(plan)
+    workflow_format = plan.get("format_version", FORMAT)
     if resume_suite:
         suite = _path(resume_suite, project)
         state = _read(suite / "suite.json")
-        if state.get("format_version") != FORMAT or state.get("protocol_sha256") != signature:
-            raise ValueError("Resume request differs from the saved ABCD protocol; start a new suite")
+        if state.get("format_version") != workflow_format or state.get("protocol_sha256") != signature:
+            raise ValueError("Resume request differs from the saved experiment protocol; start a new suite")
         if set(state.get("jobs", {})) != {job["id"] for job in plan["jobs"]}:
             raise ValueError("Resume manifest job set differs from this request")
     else:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         suite = Path(plan["output_root"]) / "suites" / f"suite_{stamp}_{uuid.uuid4().hex[:8]}"
         suite.mkdir(parents=True)
-        state = {"format_version": FORMAT, "protocol_sha256": signature, "plan": plan,
+        state = {"format_version": workflow_format, "protocol_sha256": signature, "plan": plan,
                  "jobs": {job["id"]: {"job": job, "status": "pending", "attempts": []} for job in plan["jobs"]}}
     print(f"Suite directory: {suite}", flush=True)
     for record in state["jobs"].values():
@@ -418,7 +438,8 @@ def run_suite(plan, *, check_only=False, resume_suite=None, launcher=None, verif
         candidates = []
         if record.get("resume_eligible") and record.get("result", {}).get("run"):
             candidates.append((record["result"]["run"], "resumed"))
-        candidates.extend((str(run), "reused") for run in _reuse_candidates(plan["reuse_suites"], job["condition"]))
+        candidates.extend((str(run), "reused") for run in _reuse_candidates(
+            plan["reuse_suites"], job["condition"], seed=job["seed"], student_mode=job["student_mode"]))
         rejections = []
         for candidate, source in candidates:
             try:
@@ -485,13 +506,16 @@ def metric_rows(state):
                "distillation_trainable_parameters": result.get("distillation_trainable_parameters", record.get("check", {}).get("distillation_trainable_parameters")),
                "run": result.get("run", ""), "error": record.get("error", "")}
         row["ap"] = test.get("average_precision", test.get("ap"))
+        for key in ("soft_weight", "global_weight", "local_weight"):
+            row[key] = job["config"].get("distillation", {}).get(key) if job["condition"] == "distillation" else 0.0
         rows.append(row)
     return rows
 
 
 def summary_rows(rows):
     summaries = []
-    for group in GROUPS:
+    ordered_groups = list(GROUPS) + list(dict.fromkeys(row["group"] for row in rows if row["group"] not in GROUPS))
+    for group in ordered_groups:
         selected = [row for row in rows if row["group"] == group]
         if not selected:
             continue
@@ -499,6 +523,9 @@ def summary_rows(rows):
         summary = {"group": group, "student_mode": selected[0]["student_mode"], "condition": selected[0]["condition"],
                    "n_completed": len(completed), "n_requested": len(selected),
                    "seeds": ",".join(str(row["seed"]) for row in completed)}
+        for key in ("soft_weight", "global_weight", "local_weight"):
+            if key in selected[0]:
+                summary[key] = selected[0][key]
         for metric in METRICS:
             values = [float(row[metric]) for row in completed
                       if isinstance(row.get(metric), (int, float)) and math.isfinite(row[metric])]
