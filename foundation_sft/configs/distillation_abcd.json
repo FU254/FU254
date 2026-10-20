@@ -1,0 +1,15 @@
+{
+  "output_root": "runs/distillation_abcd",
+  "seeds": [42, 43, 44],
+  "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+  "max_parallel": 4,
+  "reuse_suites": [
+    "runs/single_teacher_distillation/suites/suite_20261019T110343Z_3b1acd96"
+  ],
+  "groups": {
+    "A": {"student_mode": "full_finetune", "condition": "supervised", "config": "foundation_sft/configs/distillation_rad_dino_vit_tiny.json"},
+    "B": {"student_mode": "full_finetune", "condition": "distillation", "config": "foundation_sft/configs/distillation_rad_dino_vit_tiny.json"},
+    "C": {"student_mode": "lora", "condition": "supervised", "config": "foundation_sft/configs/distillation_rad_dino_vit_tiny_lora.json"},
+    "D": {"student_mode": "lora", "condition": "distillation", "config": "foundation_sft/configs/distillation_rad_dino_vit_tiny_lora.json"}
+  }
+}

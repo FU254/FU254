@@ -11,6 +11,7 @@ from unittest import mock
 import torch
 
 from foundation_sft.models import vit_tiny_student as student
+from foundation_sft.distillation_losses import SingleTeacherDistillationLoss
 
 
 HAS_TIMM = importlib.util.find_spec("timm") is not None
@@ -53,11 +54,33 @@ class ViTTinyStudentTests(unittest.TestCase):
         cls.temp.cleanup()
         torch.set_num_threads(cls.old_threads)
 
-    def build(self):
+    def build(self, **kwargs):
         # Fixture architecture tests do not pretend synthetic tensors have the
         # official file's identity; bypass only its external source checksum.
         with mock.patch.object(student, "sha256_file", return_value=SYNTHETIC_SHA256):
-            return student.build_vit_tiny_student(self.checkpoint)
+            return student.build_vit_tiny_student(self.checkpoint, **kwargs)
+
+    def test_full_finetune_legacy_metadata_and_state_schema_are_unchanged(self):
+        model = self.build()
+        expected = {
+            "model": "vit_tiny_student", "architecture": student.ARCHITECTURE,
+            "mode": "full_finetune", "feature_dim": 192,
+            "preprocessing": {
+                "image_size": 224, "mean": (0.485, 0.456, 0.406), "std": (0.229, 0.224, 0.225),
+                "resize_mode": "resize", "resize_shortest_edge": None,
+                "interpolation": "bicubic", "do_hist_equalization": False,
+            },
+            "initialization": {
+                "architecture": student.ARCHITECTURE, "official_checkpoint_url": student.CHECKPOINT_URL,
+                "checkpoint": str(self.checkpoint.resolve()), "checkpoint_sha256": SYNTHETIC_SHA256,
+                "pretraining": "ImageNet-1k", "source_num_classes": 1000, "variant": "single_cls",
+            },
+            "total_parameters": 5524609, "trainable_parameters": 5524609,
+        }
+        self.assertEqual(model.training_metadata(), expected)
+        self.assertEqual(model.training_mode, "full_finetune")
+        self.assertIsNone(model.lora)
+        self.assertFalse(any("lora_" in name or ".base." in name for name in model.state_dict()))
 
     def test_native_cls_patch_layout_single_forward_and_full_gradients(self):
         model = self.build().eval()
@@ -187,6 +210,152 @@ class ViTTinyStudentTests(unittest.TestCase):
         for shape in ((1, 3, 224, 240), (1, 1, 224, 224), (3, 224, 224)):
             with self.subTest(shape=shape), self.assertRaisesRegex(ValueError, "224"):
                 model(torch.randn(shape))
+
+    def test_lora_trains_only_twelve_qkv_adapters_and_linear_head(self):
+        model = self.build(mode="lora", rank=8, alpha=16.0).train()
+        expected_targets = [f"encoder.blocks.{index}.attn.qkv" for index in range(12)]
+        self.assertEqual(model.training_mode, "lora")
+        self.assertEqual(model.lora, {"rank": 8, "alpha": 16.0, "targets": expected_targets})
+        metadata = model.training_metadata()
+        self.assertEqual(metadata["mode"], "lora")
+        self.assertEqual(metadata["lora"], model.lora)
+        self.assertEqual(metadata["trainable_parameters"], 73921)
+        self.assertEqual(metadata["total_parameters"], 5598337)
+        self.assertIsInstance(model.encoder.head, torch.nn.Linear)
+        self.assertEqual(tuple(model.encoder.head.weight.shape), (1, 192))
+        frozen = {name: parameter.detach().clone() for name, parameter in model.named_parameters()
+                  if not parameter.requires_grad}
+        trainable = {name: parameter.detach().clone() for name, parameter in model.named_parameters()
+                     if parameter.requires_grad}
+        self.assertEqual(len(trainable), 26)
+        self.assertTrue(all(name.endswith(("lora_A", "lora_B")) or name in {
+            "encoder.head.weight", "encoder.head.bias"
+        } for name in trainable))
+        for name, value in frozen.items():
+            source_name = name.removeprefix("encoder.").replace(".qkv.base.", ".qkv.")
+            torch.testing.assert_close(value, self.reference_state[source_name], rtol=0, atol=0)
+
+        images = torch.randn(2, 3, 224, 224)
+        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.001)
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            output = model(images, return_features=True)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(output["logits"], torch.tensor([0.0, 1.0]))
+            loss.backward()
+            for name, parameter in model.named_parameters():
+                if name in frozen:
+                    self.assertIsNone(parameter.grad, name)
+                else:
+                    self.assertIsNotNone(parameter.grad, name)
+                    self.assertTrue(torch.isfinite(parameter.grad).all(), name)
+            optimizer.step()
+        parameters = dict(model.named_parameters())
+        for name, value in frozen.items():
+            torch.testing.assert_close(parameters[name], value, rtol=0, atol=0, msg=name)
+        for name in trainable:
+            self.assertFalse(torch.equal(trainable[name], parameters[name].detach()), name)
+        self.assertTrue(all(parameters[f"{target}.lora_B"].detach().abs().sum().item() > 0
+                            for target in expected_targets))
+
+    def test_lora_all_three_kd_terms_backpropagate_to_adapters(self):
+        model = self.build(mode="lora")
+        images = torch.randn(1, 3, 224, 224)
+        teacher_logits = torch.tensor([2.0], requires_grad=True)
+        teacher_global = torch.randn(1, 768, requires_grad=True)
+        teacher_patches = torch.randn(1, 196, 768, requires_grad=True)
+        for term in ("soft", "global", "local"):
+            with self.subTest(term=term):
+                model.zero_grad(set_to_none=True)
+                output = model(images, return_features=True)
+                kd = SingleTeacherDistillationLoss(
+                    student_dim=192, teacher_dim=768,
+                    soft_weight=float(term == "soft"), global_weight=float(term == "global"),
+                    local_weight=float(term == "local"), pool_grid=(7, 7),
+                )
+                values = kd(output["logits"], teacher_logits,
+                            student_global=output["global_features"], teacher_global=teacher_global,
+                            student_patches=output["local_features"], teacher_patches=teacher_patches,
+                            student_grid=output["grid_shape"], teacher_grid=(14, 14))
+                values["total"].backward()
+                for target in model.lora["targets"]:
+                    gradient = model.get_parameter(f"{target}.lora_B").grad
+                    self.assertIsNotNone(gradient, target)
+                    self.assertTrue(torch.isfinite(gradient).all(), target)
+                    self.assertGreater(gradient.abs().sum().item(), 0, target)
+                if term == "soft":
+                    self.assertIsNotNone(model.encoder.head.weight.grad)
+                else:
+                    self.assertIsNone(model.encoder.head.weight.grad)
+                if term == "global":
+                    self.assertEqual(sum(parameter.numel() for parameter in kd.parameters()), 147456)
+                    self.assertIsNotNone(kd.projector.weight.grad)
+                    self.assertGreater(kd.projector.weight.grad.abs().sum().item(), 0)
+                self.assertTrue(all(parameter.grad is None for parameter in model.parameters()
+                                    if not parameter.requires_grad))
+                self.assertTrue(all(value.grad is None for value in (teacher_logits, teacher_global, teacher_patches)))
+
+    def test_lora_complete_restore_preserves_metadata_and_rejects_other_modes_or_ranks(self):
+        model = self.build(mode="lora").eval()
+        with torch.no_grad():
+            model.encoder.blocks[0].attn.qkv.lora_B.add_(0.01)
+            model.encoder.head.bias.add_(0.2)
+        images = torch.randn(1, 3, 224, 224)
+        with torch.no_grad():
+            expected = model(images, return_features=True)
+        state, metadata = model.trainable_state_dict(), model.training_metadata()
+        self.assertEqual(set(state), set(model.state_dict()))
+        self.assertIn("encoder.patch_embed.proj.weight", state)
+        self.assertIn("encoder.blocks.0.attn.qkv.base.weight", state)
+        metadata["initialization"]["checkpoint"] = "/missing/original-imagenet.pth"
+        with mock.patch.object(student.torch, "load", side_effect=AssertionError("No source file needed")):
+            restored = student.build_vit_tiny_student(
+                initialization=metadata["initialization"], mode=metadata["mode"],
+                rank=metadata["lora"]["rank"], alpha=metadata["lora"]["alpha"],
+            ).eval()
+            self.assertEqual(restored.training_metadata(), metadata)
+            with self.assertRaisesRegex(RuntimeError, "complete student state"):
+                restored(images)
+            restored.load_trainable_state_dict(state)
+            with torch.no_grad():
+                actual = restored(images, return_features=True)
+        for name in ("logits", "global_features", "local_features"):
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+        for name, value in state.items():
+            torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
+        self.assertEqual(restored.training_metadata(), metadata)
+
+        full = self.build()
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            full.load_trainable_state_dict(state)
+        with self.assertRaisesRegex(ValueError, "mismatch"):
+            model.load_trainable_state_dict(full.trainable_state_dict())
+        wrong_rank = student.build_vit_tiny_student(initialization=metadata["initialization"], mode="lora", rank=4)
+        with self.assertRaisesRegex(ValueError, "shape/dtype"):
+            wrong_rank.load_trainable_state_dict(state)
+        for defect in ("missing_frozen_base", "nonfinite_frozen_base", "adapter_dtype"):
+            damaged = dict(state)
+            if defect == "missing_frozen_base":
+                del damaged["encoder.patch_embed.proj.weight"]
+            elif defect == "nonfinite_frozen_base":
+                key = "encoder.patch_embed.proj.weight"
+                damaged[key] = torch.full_like(state[key], float("nan"))
+            else:
+                key = "encoder.blocks.0.attn.qkv.lora_B"
+                damaged[key] = state[key].double()
+            with self.subTest(defect=defect), self.assertRaises(ValueError):
+                restored.load_trainable_state_dict(damaged)
+
+    def test_mode_rank_and_alpha_validation_precedes_checkpoint_io(self):
+        invalid = [
+            {"mode": "linear_probe"}, {"mode": True},
+            {"rank": True}, {"rank": 0}, {"rank": -1}, {"rank": 8.0},
+            {"alpha": True}, {"alpha": 0}, {"alpha": -1},
+            {"alpha": float("nan")}, {"alpha": float("inf")}, {"alpha": "16"},
+        ]
+        with mock.patch.object(student, "sha256_file", side_effect=AssertionError("Validation must precede IO")):
+            for kwargs in invalid:
+                with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                    student.build_vit_tiny_student(self.checkpoint, **kwargs)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
-"""Fully trainable, single-CLS DeiT-Tiny/16 student; never downloads weights.
+"""Single-CLS DeiT-Tiny/16 student with full or LoRA training, always offline.
 
 Fresh training::
 
     model = build_vit_tiny_student("deit_tiny_patch16_224-a1311bcf.pth")
+
+    # Optional: freeze the ImageNet base and train QKV LoRA plus a linear head.
+    model = build_vit_tiny_student("deit_tiny_patch16_224-a1311bcf.pth", mode="lora")
 
 Evaluation/resume from a saved student needs no original ImageNet file::
 
@@ -12,18 +15,21 @@ Evaluation/resume from a saved student needs no original ImageNet file::
 
 The second form cannot run forward until the complete student state is loaded.
 Save ``training_metadata()`` and the complete ``trainable_state_dict()`` together.
+For LoRA reconstruction, also pass the saved mode, LoRA rank and alpha to the
+factory. Both modes save the entire encoder, so neither needs its source file.
 """
 
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict
+import math
 from pathlib import Path
 import re
 
 import torch
 from torch import nn
 
-from .common import BackboneFeatures, PreprocessSpec, sha256_file
+from .common import BackboneFeatures, PreprocessSpec, inject_lora, sha256_file
 
 
 ARCHITECTURE = "deit_tiny_patch16_224"
@@ -32,6 +38,16 @@ CHECKPOINT_SHA256_PREFIX = "a1311bcf"
 FEATURE_DIM = 192
 IMAGE_SIZE = 224
 GRID_SHAPE = (14, 14)
+
+
+def _validate_training(mode, rank, alpha):
+    if mode not in ("full_finetune", "lora"):
+        raise ValueError("Student mode must be full_finetune or lora")
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+        raise ValueError("Student LoRA rank must be a positive integer")
+    if (isinstance(alpha, bool) or not isinstance(alpha, (int, float))
+            or not math.isfinite(alpha) or alpha <= 0):
+        raise ValueError("Student LoRA alpha must be positive and finite")
 
 
 def _validate_initialization(initialization):
@@ -96,16 +112,28 @@ def _new_encoder(num_classes):
 
 
 class ViTTinyStudent(nn.Module):
-    """All student weights, including the one-logit head, receive gradients."""
+    """One linear output head, with full encoder tuning or QKV LoRA tuning."""
 
-    def __init__(self, encoder, initialization, *, ready):
+    def __init__(self, encoder, initialization, *, ready, mode="full_finetune", rank=8, alpha=16.0):
         super().__init__()
+        _validate_training(mode, rank, alpha)
         self.encoder = encoder
         self.feature_dim = FEATURE_DIM
         self.preprocess = PreprocessSpec(IMAGE_SIZE)
         self.initialization = _validate_initialization(initialization)
         self._ready = ready
-        self.requires_grad_(True)
+        self.training_mode = mode
+        self.lora = None
+        if mode == "full_finetune":
+            self.requires_grad_(True)
+        else:
+            self.encoder.requires_grad_(False)
+            targets = inject_lora(self, rank=rank, alpha=alpha)
+            self.encoder.head.requires_grad_(True)
+            self.lora = {"rank": rank, "alpha": float(alpha), "targets": targets}
+
+    def lora_target_names(self):
+        return [f"encoder.blocks.{index}.attn.qkv" for index in range(12)]
 
     def forward(self, images, return_features=False):
         if not self._ready:
@@ -139,32 +167,39 @@ class ViTTinyStudent(nn.Module):
         self._ready = True
 
     def training_metadata(self):
-        return {
+        metadata = {
             "model": "vit_tiny_student",
             "architecture": ARCHITECTURE,
-            "mode": "full_finetune",
+            "mode": self.training_mode,
             "feature_dim": self.feature_dim,
             "preprocessing": asdict(self.preprocess),
             "initialization": deepcopy(self.initialization),
             "total_parameters": sum(parameter.numel() for parameter in self.parameters()),
             "trainable_parameters": sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad),
         }
+        # Preserve the exact legacy full-finetune metadata schema.
+        if self.lora is not None:
+            metadata["lora"] = deepcopy(self.lora)
+        return metadata
 
 
-def build_vit_tiny_student(checkpoint=None, *, initialization=None):
+def build_vit_tiny_student(checkpoint=None, *, initialization=None, mode="full_finetune", rank=8, alpha=16.0):
     """Build from an official ImageNet file OR saved source metadata, offline.
 
     ``checkpoint`` is the original 1000-class single-CLS release, verified by
     SHA256 prefix and loaded strictly before replacing its head. ``initialization``
     is the dict from ``training_metadata()``; this reconstruction form requires
     a subsequent strict ``load_trainable_state_dict`` of the complete student.
+    ``mode='lora'`` freezes original weights and trains QKV adapters plus the
+    one-logit linear head. Pass the saved mode/rank/alpha when reconstructing it.
     No randomly initialized training mode or automatic download is provided.
     """
+    _validate_training(mode, rank, alpha)
     if (checkpoint is None) == (initialization is None):
         raise ValueError("Provide either an official checkpoint or saved initialization metadata")
     if initialization is not None:
         initialization = _validate_initialization(initialization)
-        return ViTTinyStudent(_new_encoder(1), initialization, ready=False)
+        return ViTTinyStudent(_new_encoder(1), initialization, ready=False, mode=mode, rank=rank, alpha=alpha)
 
     path = Path(checkpoint).expanduser().resolve()
     if not path.is_file():
@@ -188,4 +223,4 @@ def build_vit_tiny_student(checkpoint=None, *, initialization=None):
         "source_num_classes": 1000,
         "variant": "single_cls",
     }
-    return ViTTinyStudent(encoder, initialization, ready=True)
+    return ViTTinyStudent(encoder, initialization, ready=True, mode=mode, rank=rank, alpha=alpha)

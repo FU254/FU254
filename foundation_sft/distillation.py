@@ -115,6 +115,11 @@ def _training_settings(teacher_config, config):
     settings = deepcopy(teacher_config["training"])
     settings.update({"backbone_lr": 5e-5, "projection_lr": 1e-4})
     settings.update(config.get("training", {}))
+    lora = _student_options(config)["mode"] == "lora"
+    if lora:
+        # The teacher's optimizer LR belongs to a different experiment. Keep
+        # the student update LR controlled against the full-finetune backbone.
+        settings["lora_lr"] = config.get("training", {}).get("lora_lr", settings["backbone_lr"])
     if settings.get("amp") is not False:
         raise ValueError("This first paired KD protocol requires training.amp=false (FP32)")
     for key in ("epochs", "patience", "batch_size", "accumulation_steps"):
@@ -122,7 +127,8 @@ def _training_settings(teacher_config, config):
             raise ValueError(f"training.{key} must be a positive integer")
     if type(settings["num_workers"]) is not int or settings["num_workers"] < 0:
         raise ValueError("training.num_workers must be nonnegative")
-    for key in ("backbone_lr", "head_lr", "projection_lr", "gradient_clip", "focal_scale"):
+    rates = ("lora_lr" if lora else "backbone_lr", "head_lr", "projection_lr")
+    for key in (*rates, "gradient_clip", "focal_scale"):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise ValueError(f"training.{key} must be positive and finite")
@@ -130,9 +136,34 @@ def _training_settings(teacher_config, config):
         value = settings[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f"training.{key} must be nonnegative and finite")
-    if settings["minimum_lr"] > min(settings[key] for key in ("backbone_lr", "head_lr", "projection_lr")):
+    if settings["minimum_lr"] > min(settings[key] for key in rates):
         raise ValueError("minimum_lr must not exceed any initial learning rate")
     return settings
+
+
+def _student_options(config):
+    """Validate the update mode before loading any large weights or patient data."""
+    settings = config.get("student", {})
+    if not isinstance(settings, dict) or set(settings) - {"mode", "rank", "alpha"}:
+        raise ValueError("student must contain only mode, rank and alpha")
+    mode = settings.get("mode", "full_finetune")
+    if mode not in ("full_finetune", "lora"):
+        raise ValueError("student.mode must be full_finetune or lora")
+    rank, alpha = settings.get("rank", 8), settings.get("alpha", 16.0)
+    if type(rank) is not int or rank <= 0:
+        raise ValueError("student.rank must be a positive integer")
+    if (isinstance(alpha, bool) or not isinstance(alpha, (int, float))
+            or not math.isfinite(alpha) or alpha <= 0):
+        raise ValueError("student.alpha must be positive and finite")
+    return {"mode": mode, "rank": rank, "alpha": float(alpha)} if mode == "lora" else {"mode": mode}
+
+
+def _build_student(config):
+    options = _student_options(config)
+    if options["mode"] == "full_finetune":
+        # Preserve the original factory call and original full metadata schema.
+        return build_vit_tiny_student(config["student_checkpoint"])
+    return build_vit_tiny_student(config["student_checkpoint"], **options)
 
 
 def _loader(split, name, teacher_spec, student_spec, config, generator=None, include_teacher=False):
@@ -153,12 +184,15 @@ def _loader(split, name, teacher_spec, student_spec, config, generator=None, inc
 def _optimizer(student, kd, train):
     head_ids = {id(parameter) for parameter in student.encoder.head.parameters()}
     head, backbone = [], []
-    for parameter in student.parameters():
+    lora = getattr(student, "training_mode", "full_finetune") == "lora"
+    for name, parameter in student.named_parameters():
         if parameter.requires_grad:
+            if lora and id(parameter) not in head_ids and not name.endswith((".lora_A", ".lora_B")):
+                raise ValueError(f"LoRA student unexpectedly trains an original encoder tensor: {name}")
             (head if id(parameter) in head_ids else backbone).append(parameter)
     if not head or not backbone:
         raise ValueError("Student must train both the encoder and classification head")
-    groups = [{"params": backbone, "lr": train["backbone_lr"]},
+    groups = [{"params": backbone, "lr": train["lora_lr" if lora else "backbone_lr"]},
               {"params": head, "lr": train["head_lr"]}]
     if kd is not None:
         projection = [parameter for parameter in kd.parameters() if parameter.requires_grad]
@@ -239,7 +273,17 @@ def load_student_checkpoint(path, device="cpu"):
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("format_version") != FORMAT:
         raise ValueError("Not a single-teacher ViT-Tiny student checkpoint")
-    student = build_vit_tiny_student(initialization=payload["model_metadata"]["initialization"])
+    metadata = payload["model_metadata"]
+    mode = metadata.get("mode", "full_finetune")
+    if mode == "full_finetune":
+        student = build_vit_tiny_student(initialization=metadata["initialization"])
+    elif mode == "lora":
+        saved = metadata.get("lora", {})
+        options = _student_options({"student": {"mode": mode, "rank": saved.get("rank"),
+                                                "alpha": saved.get("alpha")}})
+        student = build_vit_tiny_student(initialization=metadata["initialization"], **options)
+    else:
+        raise ValueError("Unsupported saved student update mode")
     if student.training_metadata() != payload["model_metadata"]:
         raise ValueError("Saved student architecture or initialization metadata differs")
     student.load_trainable_state_dict(payload["model"])
@@ -270,7 +314,7 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
     run.mkdir()
     device, train = supervised._device(config), config["training"]
     supervised.set_seed(config["seed"])
-    student = build_vit_tiny_student(config["student_checkpoint"]).to(device)
+    student = _build_student(config).to(device)
     initial_hash = _state_hash(student.state_dict())
     if expected_initial is not None and initial_hash != expected_initial:
         raise ValueError("Supervised and distilled students must start from exactly the same state")
@@ -368,6 +412,9 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
     result = save_evaluation(test, run / "test", threshold=restored_payload["threshold"],
                              bootstrap_samples=config["evaluation"]["bootstrap_samples"], seed=config["seed"])
     receipt = {"condition": condition, "status": "completed", "run": str(run),
+               "student_mode": _student_options(config)["mode"],
+               "student_trainable_parameters": sum(p.numel() for p in student.parameters() if p.requires_grad),
+               "distillation_trainable_parameters": sum(p.numel() for p in kd.parameters() if p.requires_grad) if kd is not None else 0,
                "seed": config["seed"], "initial_state_sha256": initial_hash,
                "cohort_hash": cohort_hash, "best_val_patient_roc_auc": best_auc,
                "threshold": threshold, "test_patient": result["patient"],
@@ -380,6 +427,7 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
 
 def _resolved(config, project):
     config = deepcopy(config)
+    _student_options(config)
     if type(config.get("seed", 42)) is not int or not 0 <= config.get("seed", 42) < 2**32:
         raise ValueError("seed must be an integer in [0, 2**32)")
     config.setdefault("seed", 42)
@@ -423,7 +471,10 @@ def _new_suite(config, kind="suite"):
     return suite
 
 
-def run_experiments(config, project):
+def run_experiments(config, project, conditions=None):
+    conditions = tuple(CONDITIONS if conditions is None else conditions)
+    if not conditions or len(set(conditions)) != len(conditions) or any(c not in CONDITIONS for c in conditions):
+        raise ValueError("Select supervised and/or distillation once each")
     config, teacher, split, info = _prepare(config, project)
     suite = _new_suite(config)
     supervised._json(suite / "config.json", config)
@@ -431,7 +482,7 @@ def run_experiments(config, project):
     supervised._json(suite / "suite.json", status)
     print(f"Suite directory: {suite}", flush=True)
     initial_hash = None
-    for condition in CONDITIONS:
+    for condition in conditions:
         try:
             receipt = _run_condition(condition, suite, teacher, split, config, info, initial_hash)
             initial_hash = receipt["initial_state_sha256"]
@@ -453,19 +504,23 @@ def run_experiments(config, project):
     return suite
 
 
-def check(config, project):
+def check(config, project, condition="distillation"):
+    if condition not in CONDITIONS:
+        raise ValueError("Unknown training condition")
     config, teacher, split, info = _prepare(config, project)
     device = supervised._device(config)
     supervised.set_seed(config["seed"])
-    student = build_vit_tiny_student(config["student_checkpoint"]).to(device)
-    teacher.to(device).eval()
+    student = _build_student(config).to(device)
+    initial_hash = _state_hash(student.state_dict())
+    teacher.to(device if condition == "distillation" else "cpu").eval()
     before = _state_hash(teacher.state_dict())
-    kd = SingleTeacherDistillationLoss(student_dim=student.feature_dim,
+    kd = (SingleTeacherDistillationLoss(student_dim=student.feature_dim,
                                       teacher_dim=teacher.adapter.feature_dim,
                                       **config["distillation"]).to(device)
+          if condition == "distillation" else None)
     hard_loss = supervised.FocalLoss(config["training"]["focal_gamma"], config["training"]["focal_scale"])
     loader = _loader(split, "train", teacher.adapter.preprocess, student.preprocess, config,
-                     torch.Generator().manual_seed(config["seed"]), include_teacher=True)
+                     torch.Generator().manual_seed(config["seed"]), include_teacher=kd is not None)
     batch = next(iter(loader))
     values = _batch_loss(student, teacher, kd, batch, hard_loss, device)
     values["total"].backward()
@@ -473,10 +528,10 @@ def check(config, project):
                           if not name.startswith("encoder.head.") and parameter.grad is not None]
     if not backbone_gradients or not any(gradient.abs().sum().item() > 0 for gradient in backbone_gradients):
         raise RuntimeError("Student backbone received no nonzero training gradients")
-    if any(not torch.isfinite(parameter.grad).all() for parameter in list(student.parameters()) + list(kd.parameters())
+    if any(not torch.isfinite(parameter.grad).all() for parameter in list(student.parameters()) + (list(kd.parameters()) if kd is not None else [])
            if parameter.grad is not None):
         raise RuntimeError("Smoke backward produced non-finite gradients")
-    if kd.projector is not None and (kd.projector.weight.grad is None or not kd.projector.weight.grad.abs().sum().item()):
+    if kd is not None and kd.projector is not None and (kd.projector.weight.grad is None or not kd.projector.weight.grad.abs().sum().item()):
         raise RuntimeError("Global projection received no gradients")
     if before != _state_hash(teacher.state_dict()) or any(parameter.grad is not None for parameter in teacher.parameters()):
         raise RuntimeError("Teacher changed in smoke test")
@@ -486,7 +541,7 @@ def check(config, project):
     directory = _new_suite(config, kind="check")
     snapshot = directory / "roundtrip.pt"
     supervised._torch_save(snapshot, _student_payload(student, config, supervised._split_hash(split),
-                            "distillation", _state_hash(student.state_dict()), info, loader.dataset.metadata()))
+                            condition, initial_hash, info, loader.dataset.metadata()))
     restored, _ = load_student_checkpoint(snapshot, device)
     with torch.no_grad():
         actual = restored(batch["image"].to(device)).detach().cpu()
@@ -496,9 +551,17 @@ def check(config, project):
               "teacher_unchanged": True, "student_full_checkpoint_roundtrip": True,
               "teacher_features": teacher.adapter.feature_dim, "student_features": student.feature_dim,
               "losses": {name: value.detach().item() for name, value in values.items()},
-              "cohort_hash": supervised._split_hash(split), "shared_view": loader.dataset.metadata()}
+              "cohort_hash": supervised._split_hash(split), "shared_view": loader.dataset.metadata(),
+              "config": config, "effective_training": config["training"],
+              "condition": condition, "student_mode": _student_options(config)["mode"],
+              "model_metadata": student.training_metadata(), "initial_state_sha256": initial_hash,
+              "teacher": info,
+              "student_trainable_parameters": sum(p.numel() for p in student.parameters() if p.requires_grad),
+              "distillation_trainable_parameters": sum(p.numel() for p in kd.parameters() if p.requires_grad) if kd is not None else 0}
     supervised._json(directory / "check.json", result)
-    print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    print(json.dumps({key: value for key, value in result.items()
+                      if key not in {"config", "effective_training", "teacher", "model_metadata"}},
+                     ensure_ascii=False, indent=2), flush=True)
     print(f"Check completed (no training run): {directory}", flush=True)
     return directory
 
@@ -506,7 +569,8 @@ def check(config, project):
 def _metric_row(receipt):
     metrics = receipt["test_patient"]
     ci = receipt.get("roc_auc_ci") or {}
-    return {"condition": receipt["condition"], "seed": receipt["seed"],
+    return {"condition": receipt["condition"], "student_mode": receipt.get("student_mode", "full_finetune"),
+            "seed": receipt["seed"],
             "val_auc": receipt["best_val_patient_roc_auc"], "roc_auc": metrics["roc_auc"],
             "roc_ci_lower": ci.get("lower"), "roc_ci_upper": ci.get("upper"),
             "pr_auc": metrics["pr_auc"], "ap": metrics["average_precision"],
@@ -529,7 +593,7 @@ def show_metrics(config, project, suite=None):
         found = True
         print(f"\nBatch: {batch}")
         names = list(rows[0])
-        formatted = [[str(row[key]) if key in {"condition", "seed"} else
+        formatted = [[str(row[key]) if key in {"condition", "student_mode", "seed"} else
                       ("-" if row[key] is None else f"{row[key]:.4f}") for key in names] for row in rows]
         widths = [max(len(name), *(len(row[index]) for row in formatted)) for index, name in enumerate(names)]
         print("  ".join(name.ljust(widths[index]) for index, name in enumerate(names)))
@@ -551,6 +615,9 @@ def main(argv=None):
     parser.add_argument("--student-checkpoint")
     parser.add_argument("--cache-dir")
     parser.add_argument("--device")
+    parser.add_argument("--condition", choices=CONDITIONS,
+                        help="Run/check one condition; default training still runs the paired experiment")
+    parser.add_argument("--result-json", help="Write a machine-readable check or training receipt")
     args = parser.parse_args(argv)
     project = Path(args.project).expanduser().resolve()
     config = json.loads(_path(args.config, project).read_text(encoding="utf-8"))
@@ -562,8 +629,15 @@ def main(argv=None):
     if args.show_metrics:
         return show_metrics(config, project, suite=args.suite)
     if args.check_only:
-        return check(config, project)
-    return run_experiments(config, project)
+        directory = check(config, project, condition=args.condition or "distillation")
+        receipt = json.loads((directory / "check.json").read_text(encoding="utf-8"))
+        receipt.update(action="check", directory=str(directory))
+    else:
+        directory = run_experiments(config, project, conditions=[args.condition] if args.condition else None)
+        receipt = {"suite": str(directory), **json.loads((directory / "suite.json").read_text(encoding="utf-8"))}
+    if args.result_json:
+        supervised._json(_path(args.result_json, project), receipt)
+    return directory
 
 
 if __name__ == "__main__":

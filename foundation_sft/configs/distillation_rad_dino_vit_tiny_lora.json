@@ -1,0 +1,36 @@
+{
+  "teacher_suite": "runs/foundation_sft/suites/suite_20261013T024024Z_92ac596d",
+  "teacher_checkpoint": null,
+  "student_checkpoint": "foundation_weights/vit_tiny/deit_tiny_patch16_224-a1311bcf.pth",
+  "output_root": "runs/single_teacher_distillation_lora",
+  "cache_dir": "runs/foundation_sft/data_cache",
+  "device": "cuda:0",
+  "seed": 42,
+  "training": {
+    "epochs": 100,
+    "patience": 15,
+    "batch_size": 8,
+    "accumulation_steps": 8,
+    "num_workers": 4,
+    "backbone_lr": 5e-05,
+    "head_lr": 0.0001,
+    "projection_lr": 0.0001,
+    "amp": false,
+    "lora_lr": 5e-05
+  },
+  "distillation": {
+    "temperature": 2.0,
+    "soft_weight": 0.5,
+    "global_weight": 0.1,
+    "local_weight": 1.0,
+    "pool_grid": [
+      7,
+      7
+    ]
+  },
+  "student": {
+    "mode": "lora",
+    "rank": 8,
+    "alpha": 16.0
+  }
+}
