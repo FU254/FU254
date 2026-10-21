@@ -53,6 +53,34 @@ def _state_hash(state):
     return digest.hexdigest()
 
 
+def _verify_roundtrip_state(student, restored):
+    """Check exact serialization before the restored model runs inference."""
+    original_hash = _state_hash(student.state_dict())
+    restored_hash = _state_hash(restored.state_dict())
+    if original_hash != restored_hash:
+        raise ValueError("Complete student state changed during save/reload")
+    return {"student_state_exact": True, "student_state_sha256": original_hash,
+            "restored_state_sha256": restored_hash}
+
+
+def _verify_roundtrip_outputs(expected, actual, batch_size):
+    """Allow bounded FP32 inference roundoff after an exact state comparison."""
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("Roundtrip batch size must be a positive integer")
+    for name, value in (("expected", expected), ("actual", actual)):
+        if (not isinstance(value, torch.Tensor) or not value.is_floating_point()
+                or tuple(value.shape) != (batch_size,)):
+            raise ValueError(f"Roundtrip {name} logits must have shape [batch_size]")
+        if not torch.isfinite(value).all().item():
+            raise ValueError(f"Roundtrip {name} logits contain non-finite values")
+    # The weights are checked separately and exactly. CUDA FP32 inference may
+    # vary slightly near zero even with identical restored tensors.
+    rtol, atol = 1e-4, 1e-5
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+    return {"roundtrip_max_abs_error": (actual - expected).abs().max().item(),
+            "roundtrip_rtol": rtol, "roundtrip_atol": atol}
+
+
 def resolve_teacher_checkpoint(config, project):
     if config.get("teacher_checkpoint"):
         checkpoint = _path(config["teacher_checkpoint"], project)
@@ -543,11 +571,13 @@ def check(config, project, condition="distillation"):
     supervised._torch_save(snapshot, _student_payload(student, config, supervised._split_hash(split),
                             condition, initial_hash, info, loader.dataset.metadata()))
     restored, _ = load_student_checkpoint(snapshot, device)
+    roundtrip_state = _verify_roundtrip_state(student, restored)
     with torch.no_grad():
         actual = restored(batch["image"].to(device)).detach().cpu()
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    roundtrip_outputs = _verify_roundtrip_outputs(expected, actual, len(batch["label"]))
     snapshot.unlink()
     result = {"check_passed": True, "training_started": False,
+              **roundtrip_state, **roundtrip_outputs,
               "teacher_unchanged": True, "student_full_checkpoint_roundtrip": True,
               "teacher_features": teacher.adapter.feature_dim, "student_features": student.feature_dim,
               "losses": {name: value.detach().item() for name, value in values.items()},
