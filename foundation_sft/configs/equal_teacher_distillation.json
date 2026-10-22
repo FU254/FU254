@@ -1,0 +1,37 @@
+{
+  "template": "foundation_sft/configs/distillation_rad_dino_vit_tiny.json",
+  "output_root": "runs/equal_teacher_distillation",
+  "conditions": ["supervised", "single_teacher", "equal_teacher"],
+  "seeds": [42, 43, 44],
+  "devices": ["cuda:0"],
+  "max_parallel": 1,
+  "reuse_suites": [
+    "runs/distillation_ablation/suites/suite_20261021T090957Z_5c9c9936"
+  ],
+  "teachers": [
+    {
+      "model": "rad_dino",
+      "mode": "lora",
+      "seed": 42,
+      "suite": "runs/foundation_sft/suites/suite_20261013T024024Z_92ac596d",
+      "checkpoint": null,
+      "weight": 0.3333333333333333
+    },
+    {
+      "model": "chexfound",
+      "mode": "lora",
+      "seed": 42,
+      "suite": "runs/foundation_sft/suites/suite_20261013T024024Z_92ac596d",
+      "checkpoint": null,
+      "weight": 0.3333333333333333
+    },
+    {
+      "model": "chexzero",
+      "mode": "lora",
+      "seed": 42,
+      "suite": "runs/foundation_sft_vlm/suites/suite_20261015T045005Z_2162f5a1",
+      "checkpoint": null,
+      "weight": 0.3333333333333333
+    }
+  ]
+}
