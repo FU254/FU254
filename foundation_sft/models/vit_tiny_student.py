@@ -7,6 +7,9 @@ Fresh training::
     # Optional: freeze the ImageNet base and train QKV LoRA plus a linear head.
     model = build_vit_tiny_student("deit_tiny_patch16_224-a1311bcf.pth", mode="lora")
 
+    # Explicitly train from random weights; no source checkpoint is accessed.
+    model = build_vit_tiny_student(random_seed=42)
+
 Evaluation/resume from a saved student needs no original ImageNet file::
 
     model = build_vit_tiny_student(
@@ -17,6 +20,8 @@ The second form cannot run forward until the complete student state is loaded.
 Save ``training_metadata()`` and the complete ``trainable_state_dict()`` together.
 For LoRA reconstruction, also pass the saved mode, LoRA rank and alpha to the
 factory. Both modes save the entire encoder, so neither needs its source file.
+Random initialization is recorded separately from ImageNet initialization and
+does not change the caller's Torch random-number state.
 """
 
 from collections.abc import Mapping
@@ -54,6 +59,20 @@ def _validate_initialization(initialization):
     """Validate saved source metadata without requiring its old filesystem path."""
     if not isinstance(initialization, Mapping):
         raise ValueError("Student initialization must be saved initialization metadata")
+    if initialization.get("initialization_mode") == "random" or initialization.get("pretraining") == "none":
+        required = {
+            "architecture": ARCHITECTURE,
+            "initialization_mode": "random",
+            "pretraining": "none",
+            "source_num_classes": 1,
+            "variant": "single_cls",
+        }
+        if (set(initialization) != {*required, "seed"}
+                or type(initialization.get("source_num_classes")) is not int
+                or any(initialization.get(key) != value for key, value in required.items())):
+            raise ValueError("Random student initialization metadata differs from the single-CLS architecture")
+        _validate_random_seed(initialization.get("seed"))
+        return deepcopy(dict(initialization))
     required = {
         "architecture": ARCHITECTURE,
         "official_checkpoint_url": CHECKPOINT_URL,
@@ -68,6 +87,12 @@ def _validate_initialization(initialization):
             or not checksum.startswith(CHECKPOINT_SHA256_PREFIX)):
         raise ValueError("Student initialization lacks the official checkpoint's full SHA256")
     return deepcopy(dict(initialization))
+
+
+def _validate_random_seed(seed):
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise ValueError("random_seed must be an integer in [0, 2**32)")
+    return seed
 
 
 def _strict_load(module, state, description):
@@ -183,8 +208,9 @@ class ViTTinyStudent(nn.Module):
         return metadata
 
 
-def build_vit_tiny_student(checkpoint=None, *, initialization=None, mode="full_finetune", rank=8, alpha=16.0):
-    """Build from an official ImageNet file OR saved source metadata, offline.
+def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=None,
+                           mode="full_finetune", rank=8, alpha=16.0):
+    """Build from ImageNet, explicit random weights, or saved metadata, offline.
 
     ``checkpoint`` is the original 1000-class single-CLS release, verified by
     SHA256 prefix and loaded strictly before replacing its head. ``initialization``
@@ -192,11 +218,31 @@ def build_vit_tiny_student(checkpoint=None, *, initialization=None, mode="full_f
     a subsequent strict ``load_trainable_state_dict`` of the complete student.
     ``mode='lora'`` freezes original weights and trains QKV adapters plus the
     one-logit linear head. Pass the saved mode/rank/alpha when reconstructing it.
-    No randomly initialized training mode or automatic download is provided.
+    ``random_seed`` creates a ready-to-train random student without reading a
+    checkpoint. Its seed applies to the encoder, head and any LoRA parameters;
+    it leaves the caller's CPU and CUDA random-number states unchanged.
+    Exactly one of the three initialization arguments is required. There are
+    no automatic downloads or fallbacks from missing ImageNet weights.
     """
     _validate_training(mode, rank, alpha)
-    if (checkpoint is None) == (initialization is None):
-        raise ValueError("Provide either an official checkpoint or saved initialization metadata")
+    if sum(value is not None for value in (checkpoint, initialization, random_seed)) != 1:
+        raise ValueError("Provide either an official checkpoint, saved initialization metadata, or random_seed (exactly one)")
+    if random_seed is not None:
+        seed = _validate_random_seed(random_seed)
+        metadata = {
+            "architecture": ARCHITECTURE,
+            "initialization_mode": "random",
+            "pretraining": "none",
+            "seed": seed,
+            "source_num_classes": 1,
+            "variant": "single_cls",
+        }
+        # Build on CPU, including LoRA injection. Seeding only the CPU default
+        # generator avoids changing CUDA RNG streams used by the caller.
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(seed)
+            return ViTTinyStudent(_new_encoder(1), metadata, ready=True,
+                                  mode=mode, rank=rank, alpha=alpha)
     if initialization is not None:
         initialization = _validate_initialization(initialization)
         return ViTTinyStudent(_new_encoder(1), initialization, ready=False, mode=mode, rank=rank, alpha=alpha)

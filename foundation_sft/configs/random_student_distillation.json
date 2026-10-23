@@ -1,0 +1,30 @@
+{
+  "teacher_suite": "runs/foundation_sft/suites/suite_20261013T024024Z_92ac596d",
+  "teacher_checkpoint": null,
+  "student_initialization": "random",
+  "student_checkpoint": null,
+  "output_root": "runs/random_student_distillation",
+  "cache_dir": "runs/foundation_sft/data_cache",
+  "groups": ["A", "B"],
+  "seeds": [42, 43, 44],
+  "devices": ["cuda:0"],
+  "max_parallel": 1,
+  "training": {
+    "epochs": 100,
+    "patience": 15,
+    "batch_size": 8,
+    "accumulation_steps": 8,
+    "num_workers": 4,
+    "backbone_lr": 0.00005,
+    "head_lr": 0.0001,
+    "projection_lr": 0.0001,
+    "amp": false
+  },
+  "distillation": {
+    "temperature": 2.0,
+    "soft_weight": 0.5,
+    "global_weight": 0.1,
+    "local_weight": 1.0,
+    "pool_grid": [7, 7]
+  }
+}
