@@ -1,0 +1,8 @@
+{
+  "baseline_suite": "runs/random_student_distillation/suites/suite_20261023T131255Z_64117fb7",
+  "weight_decays": [0.001, 0.01],
+  "seeds": [42],
+  "output_root": "runs/random_student_weight_decay",
+  "devices": ["cuda:0"],
+  "max_parallel": 1
+}
