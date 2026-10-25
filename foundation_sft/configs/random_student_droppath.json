@@ -1,0 +1,9 @@
+{
+  "baseline_study": "runs/random_student_weight_decay/studies/study_20261025T045150Z_b978d3c4",
+  "seeds": [42],
+  "weight_decay": 0.01,
+  "drop_path_rate": 0.1,
+  "output_root": "runs/random_student_droppath",
+  "devices": ["cuda:0"],
+  "max_parallel": 1
+}

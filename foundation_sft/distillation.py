@@ -289,11 +289,17 @@ def _train_epoch(student, teacher, kd, loader, optimizer, hard_loss, device, tra
 
 
 def _student_payload(student, config, cohort_hash, condition, initial_hash, teacher_info, geometry):
-    return {"format_version": FORMAT, "model": student.trainable_state_dict(),
+    payload = {"format_version": FORMAT, "model": student.trainable_state_dict(),
             "model_metadata": student.training_metadata(), "config": deepcopy(config),
             "cohort_hash": cohort_hash, "condition": condition,
             "initial_state_sha256": initial_hash, "teacher": teacher_info,
             "shared_view": geometry}
+    if "regularization" in payload["model_metadata"]:
+        state = student.stochastic_state_dict()
+        if state is None:
+            raise ValueError("A DropPath student must save its independent random stream")
+        payload["student_stochastic_state"] = state
+    return payload
 
 
 def load_student_checkpoint(path, device="cpu"):
@@ -303,18 +309,35 @@ def load_student_checkpoint(path, device="cpu"):
         raise ValueError("Not a single-teacher ViT-Tiny student checkpoint")
     metadata = payload["model_metadata"]
     mode = metadata.get("mode", "full_finetune")
+    regularization = metadata.get("regularization")
+    options = {}
+    rate = 0.0
+    if regularization is not None:
+        if not isinstance(regularization, dict):
+            raise ValueError("Saved student regularization must be a dictionary")
+        rate = regularization.get("drop_path_rate")
+        if type(rate) not in (int, float) or not math.isfinite(rate) or not 0 < rate < 1:
+            raise ValueError("Saved student DropPath rate must be finite and in (0,1)")
+        options["drop_path_rate"] = rate
+    configured = payload.get("config", {}).get("training", {}).get("drop_path_rate", 0.0)
+    if type(configured) not in (int, float) or configured != rate:
+        raise ValueError("Checkpoint DropPath configuration and model metadata differ")
     if mode == "full_finetune":
-        student = build_vit_tiny_student(initialization=metadata["initialization"])
+        student = build_vit_tiny_student(initialization=metadata["initialization"], **options)
     elif mode == "lora":
         saved = metadata.get("lora", {})
-        options = _student_options({"student": {"mode": mode, "rank": saved.get("rank"),
-                                                "alpha": saved.get("alpha")}})
+        options.update(_student_options({"student": {"mode": mode, "rank": saved.get("rank"),
+                                                     "alpha": saved.get("alpha")}}))
         student = build_vit_tiny_student(initialization=metadata["initialization"], **options)
     else:
         raise ValueError("Unsupported saved student update mode")
     if student.training_metadata() != payload["model_metadata"]:
         raise ValueError("Saved student architecture or initialization metadata differs")
     student.load_trainable_state_dict(payload["model"])
+    if regularization is not None:
+        student.load_stochastic_state_dict(payload.get("student_stochastic_state"))
+    elif "student_stochastic_state" in payload:
+        raise ValueError("A zero-DropPath checkpoint must not contain a stochastic-depth stream")
     return student.to(device).eval(), payload
 
 

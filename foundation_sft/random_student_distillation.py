@@ -39,11 +39,17 @@ def _validate_config(config):
     seed = config.get("seed")
     if type(seed) is not int or not 0 <= seed < 2**32:
         raise ValueError("Student seed must be an integer in [0, 2**32)")
+    rate = config.get("training", {}).get("drop_path_rate", 0.0)
+    if type(rate) not in (int, float) or not math.isfinite(rate) or not 0 <= rate < 1:
+        raise ValueError("Student drop_path_rate must be finite and in [0,1)")
     records._same("confirmed three-term distillation", config.get("distillation"), LOSS_SETTINGS)
 
 
 def _build_student(config):
     _validate_config(config)
+    rate = config.get("training", {}).get("drop_path_rate", 0.0)
+    if rate:
+        return build_vit_tiny_student(random_seed=config["seed"], drop_path_rate=rate)
     return build_vit_tiny_student(random_seed=config["seed"])
 
 
@@ -241,6 +247,7 @@ def _run_condition(condition, suite, teacher, split, config, info, expected_init
         "precision": "FP32", "student_initialization": "random", "cohort_hash": cohort_hash})
     print(f"Run directory: {run}", flush=True)
     history, best_auc, bad_epochs, best_model, best_kd = [], -math.inf, 0, None, None
+    best_stochastic = None
     for epoch in range(train["epochs"]):
         started = time.monotonic()
         print(f"[epoch] {epoch + 1}/{train['epochs']} started; initialization=random", flush=True)
@@ -257,6 +264,7 @@ def _run_condition(condition, suite, teacher, split, config, info, expected_init
         if val_auc > best_auc:
             best_auc, bad_epochs = val_auc, 0
             best_model, best_kd = student.trainable_state_dict(), single._cpu_state(kd) if kd is not None else None
+            best_stochastic = getattr(student, "stochastic_state_dict", lambda: None)()
         else:
             bad_epochs += 1
         history.append({"epoch": epoch + 1, "epoch_seconds": time.monotonic() - started,
@@ -272,6 +280,8 @@ def _run_condition(condition, suite, teacher, split, config, info, expected_init
         payload.update(epoch=epoch, best_auc=best_auc, bad_epochs=bad_epochs, best_model=best_model,
             best_distillation_state=best_kd, distillation_state=single._cpu_state(kd) if kd is not None else None,
             optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(), rng=supervised._rng_state(generator), history=history)
+        if best_stochastic is not None:
+            payload["best_student_stochastic_state"] = best_stochastic
         supervised._torch_save(run / "last.pt", payload)
         supervised._json(run / "history.json", history)
         if bad_epochs >= train["patience"]:
@@ -286,6 +296,8 @@ def _run_condition(condition, suite, teacher, split, config, info, expected_init
         "validation_loss": "val_loss: Focal, eval mode, no random augmentation",
         "optimization_losses": "history.json retains train_loss, train_hard_loss and all KD components"})
     student.load_trainable_state_dict(best_model)
+    if best_stochastic is not None:
+        student.load_stochastic_state_dict(best_stochastic)
     validation = supervised.predict(student, val_loader, device)
     patients = aggregate_patient_predictions(validation)
     threshold = select_threshold(patients.label, patients.probability)

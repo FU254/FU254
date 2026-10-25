@@ -25,6 +25,7 @@ does not change the caller's Torch random-number state.
 """
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
 import math
@@ -43,6 +44,19 @@ CHECKPOINT_SHA256_PREFIX = "a1311bcf"
 FEATURE_DIM = 192
 IMAGE_SIZE = 224
 GRID_SHAPE = (14, 14)
+DROP_PATH_SEED_XOR = 0x44504154
+
+
+def _validate_drop_path(value):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not 0 <= value < 1):
+        raise ValueError("drop_path_rate must be finite and in [0, 1)")
+    return float(value)
+
+
+def _drop_path_context(rate, initialization, mode):
+    if rate and (mode != "full_finetune" or initialization.get("initialization_mode") != "random"):
+        raise ValueError("Positive DropPath requires a random, fully trained student")
 
 
 def _validate_training(mode, rank, alpha):
@@ -112,12 +126,13 @@ def _strict_load(module, state, description):
     module.load_state_dict(state, strict=True)
 
 
-def _new_encoder(num_classes):
+def _new_encoder(num_classes, drop_path_rate=0.0):
     try:
         import timm
     except ImportError as error:
         raise ImportError("ViT-Tiny student requires timm (validated with timm==0.9.0)") from error
-    encoder = timm.create_model(ARCHITECTURE, pretrained=False, num_classes=num_classes)
+    options = {"drop_path_rate": drop_path_rate} if drop_path_rate else {}
+    encoder = timm.create_model(ARCHITECTURE, pretrained=False, num_classes=num_classes, **options)
     patch = encoder.patch_embed
     if (getattr(encoder, "num_features", None) != FEATURE_DIM
             or getattr(encoder, "num_prefix_tokens", None) != 1
@@ -133,19 +148,35 @@ def _new_encoder(num_classes):
             or encoder.head.in_features != FEATURE_DIM
             or encoder.head.out_features != num_classes):
         raise ValueError("Expected the native single-CLS DeiT-Tiny/16 architecture")
+    if drop_path_rate:
+        expected = torch.linspace(0, drop_path_rate, 12).tolist()
+        for block, probability in zip(encoder.blocks, expected):
+            for name in ("drop_path1", "drop_path2"):
+                module = getattr(block, name, None)
+                actual = 0.0 if isinstance(module, nn.Identity) else getattr(module, "drop_prob", None)
+                if actual != probability:
+                    raise ValueError("Expected native linear DropPath schedule over 12 blocks")
     return encoder
 
 
 class ViTTinyStudent(nn.Module):
     """One linear output head, with full encoder tuning or QKV LoRA tuning."""
 
-    def __init__(self, encoder, initialization, *, ready, mode="full_finetune", rank=8, alpha=16.0):
+    def __init__(self, encoder, initialization, *, ready, mode="full_finetune", rank=8, alpha=16.0,
+                 drop_path_rate=0.0):
         super().__init__()
         _validate_training(mode, rank, alpha)
         self.encoder = encoder
         self.feature_dim = FEATURE_DIM
         self.preprocess = PreprocessSpec(IMAGE_SIZE)
         self.initialization = _validate_initialization(initialization)
+        self.drop_path_rate = _validate_drop_path(drop_path_rate)
+        _drop_path_context(self.drop_path_rate, self.initialization, mode)
+        self._drop_path_seed = None
+        self._drop_path_cpu_state = self._drop_path_cuda_state = None
+        if self.drop_path_rate:
+            self._drop_path_seed = self.initialization["seed"] ^ DROP_PATH_SEED_XOR
+            self._drop_path_cpu_state = torch.Generator(device="cpu").manual_seed(self._drop_path_seed).get_state()
         self._ready = ready
         self.training_mode = mode
         self.lora = None
@@ -165,6 +196,36 @@ class ViTTinyStudent(nn.Module):
             raise RuntimeError("Load the complete student state before using a reconstructed student")
         if images.ndim != 4 or tuple(images.shape[1:]) != (3, IMAGE_SIZE, IMAGE_SIZE):
             raise ValueError("ViT-Tiny student expects images with shape [B,3,224,224]")
+        with self._stochastic_rng(images):
+            return self._forward(images, return_features)
+
+    @contextmanager
+    def _stochastic_rng(self, images):
+        """Give DropPath its own stream, preserving data/outer model RNG draws."""
+        if not self.training or not self.drop_path_rate:
+            yield
+            return
+        if images.device.type not in {"cpu", "cuda"}:
+            raise ValueError("Isolated DropPath supports CPU and CUDA training")
+        cuda = images.device.type == "cuda"
+        index = images.device.index if cuda else None
+        if cuda and index is None:
+            index = torch.cuda.current_device()
+        if cuda and self._drop_path_cuda_state is None:
+            self._drop_path_cuda_state = torch.Generator(device=images.device).manual_seed(
+                self._drop_path_seed).get_state().cpu()
+        with torch.random.fork_rng(devices=[index] if cuda else []):
+            torch.set_rng_state(self._drop_path_cpu_state)
+            if cuda:
+                torch.cuda.set_rng_state(self._drop_path_cuda_state, index)
+            try:
+                yield
+            finally:
+                self._drop_path_cpu_state = torch.get_rng_state().clone()
+                if cuda:
+                    self._drop_path_cuda_state = torch.cuda.get_rng_state(index).cpu().clone()
+
+    def _forward(self, images, return_features=False):
         # The native timm forward already applies the final encoder norm.
         # Only the first token is CLS; the other 196 are real spatial patches.
         tokens = self.encoder.forward_features(images)
@@ -179,6 +240,51 @@ class ViTTinyStudent(nn.Module):
             return {"logits": logits, "global_features": features.global_features,
                     "local_features": features.local_features, "grid_shape": features.grid_shape}
         return logits
+
+    def stochastic_state_dict(self):
+        """Save streams separately so initial model-weight SHA is unchanged."""
+        if not self.drop_path_rate:
+            return None
+        return {"format_version": 1, "seed": self._drop_path_seed,
+                "cpu": self._drop_path_cpu_state.cpu().clone(),
+                "cuda": self._drop_path_cuda_state.cpu().clone()
+                    if self._drop_path_cuda_state is not None else None}
+
+    def load_stochastic_state_dict(self, state):
+        """Restore future masks without changing the caller's random streams."""
+        if not self.drop_path_rate:
+            if state is not None:
+                raise ValueError("A zero-DropPath student must not have stochastic state")
+            return
+        if (not isinstance(state, Mapping) or set(state) != {"format_version", "seed", "cpu", "cuda"}
+                or type(state["format_version"]) is not int or state["format_version"] != 1
+                or type(state["seed"]) is not int or state["seed"] != self._drop_path_seed):
+            raise ValueError("DropPath stochastic state metadata differs")
+        for name in ("cpu", "cuda"):
+            value = state[name]
+            if name == "cuda" and value is None:
+                continue
+            if (not isinstance(value, torch.Tensor) or value.dtype != torch.uint8
+                    or value.device.type != "cpu" or value.layout != torch.strided
+                    or value.ndim != 1 or not 0 < value.numel() <= 65536):
+                raise ValueError("Invalid DropPath " + name + " RNG state")
+        probe = torch.Generator(device="cpu")
+        try:
+            probe.set_state(state["cpu"])
+        except RuntimeError as error:
+            raise ValueError("Invalid DropPath CPU RNG state") from error
+        if probe.initial_seed() != self._drop_path_seed:
+            raise ValueError("DropPath CPU RNG state belongs to a different seed")
+        cuda_state = state["cuda"]
+        if cuda_state is not None:
+            # This format stores CUDA Philox's uint64 seed and int64 offset.
+            if cuda_state.numel() != 16:
+                raise ValueError("Invalid DropPath CUDA RNG state length")
+            cuda_seed = int.from_bytes(bytes(cuda_state[:8].tolist()), byteorder="little", signed=False)
+            if cuda_seed != self._drop_path_seed:
+                raise ValueError("DropPath CUDA RNG state belongs to a different seed")
+        self._drop_path_cpu_state = state["cpu"].clone()
+        self._drop_path_cuda_state = cuda_state.clone() if cuda_state is not None else None
 
     def trainable_state_dict(self):
         if not self._ready:
@@ -205,11 +311,14 @@ class ViTTinyStudent(nn.Module):
         # Preserve the exact legacy full-finetune metadata schema.
         if self.lora is not None:
             metadata["lora"] = deepcopy(self.lora)
+        if self.drop_path_rate:
+            metadata["regularization"] = {"drop_path_rate": self.drop_path_rate,
+                "schedule": "linear_12_blocks", "rng": "isolated_torch", "rng_seed": self._drop_path_seed}
         return metadata
 
 
 def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=None,
-                           mode="full_finetune", rank=8, alpha=16.0):
+                           mode="full_finetune", rank=8, alpha=16.0, drop_path_rate=0.0):
     """Build from ImageNet, explicit random weights, or saved metadata, offline.
 
     ``checkpoint`` is the original 1000-class single-CLS release, verified by
@@ -223,8 +332,12 @@ def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=
     it leaves the caller's CPU and CUDA random-number states unchanged.
     Exactly one of the three initialization arguments is required. There are
     no automatic downloads or fallbacks from missing ImageNet weights.
+    Positive ``drop_path_rate`` uses timm's linear 12-block schedule for random,
+    fully trained students. Save its separate stochastic state alongside weights
+    when the future training mask sequence must be reproduced.
     """
     _validate_training(mode, rank, alpha)
+    drop_path_rate = _validate_drop_path(drop_path_rate)
     if sum(value is not None for value in (checkpoint, initialization, random_seed)) != 1:
         raise ValueError("Provide either an official checkpoint, saved initialization metadata, or random_seed (exactly one)")
     if random_seed is not None:
@@ -237,16 +350,23 @@ def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=
             "source_num_classes": 1,
             "variant": "single_cls",
         }
+        _drop_path_context(drop_path_rate, metadata, mode)
         # Build on CPU, including LoRA injection. Seeding only the CPU default
         # generator avoids changing CUDA RNG streams used by the caller.
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(seed)
-            return ViTTinyStudent(_new_encoder(1), metadata, ready=True,
-                                  mode=mode, rank=rank, alpha=alpha)
+            encoder = _new_encoder(1, drop_path_rate) if drop_path_rate else _new_encoder(1)
+            return ViTTinyStudent(encoder, metadata, ready=True, mode=mode, rank=rank, alpha=alpha,
+                                  drop_path_rate=drop_path_rate)
     if initialization is not None:
         initialization = _validate_initialization(initialization)
-        return ViTTinyStudent(_new_encoder(1), initialization, ready=False, mode=mode, rank=rank, alpha=alpha)
+        _drop_path_context(drop_path_rate, initialization, mode)
+        encoder = _new_encoder(1, drop_path_rate) if drop_path_rate else _new_encoder(1)
+        return ViTTinyStudent(encoder, initialization, ready=False, mode=mode, rank=rank, alpha=alpha,
+                             drop_path_rate=drop_path_rate)
 
+    if drop_path_rate:
+        raise ValueError("Positive DropPath requires a random, fully trained student")
     path = Path(checkpoint).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Official DeiT-Tiny checkpoint not found: {path}")

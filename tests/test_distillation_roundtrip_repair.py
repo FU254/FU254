@@ -1,5 +1,6 @@
 """Repair the real published core offline while retaining every saved result."""
 
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -56,10 +57,23 @@ class DistillationRoundtripRepairTests(unittest.TestCase):
         self.assert_saved()
 
     def test_real_official_fragment_patch_matches_the_reviewed_core_exactly(self):
-        expected = (self.repo / updater.CORE).read_bytes()
-        self.assertEqual(updater._build(self.original), expected)
-        self.assertEqual(hashlib.sha256(expected).hexdigest(), updater.TARGET_SHA256)
-        compile(expected, updater.CORE, "exec")
+        # This historical repair targets its published version, while today's
+        # core may add new experiments. Use the release's independent checksum
+        # as the oracle rather than requiring the working tree to remain old.
+        with zipfile.ZipFile(self.repo / "packages/FU254-distillation-roundtrip-fix.zip") as archive:
+            prefix = "distillation_roundtrip_fix/"
+            published = archive.read(prefix + "repair_distillation_roundtrip.py")
+            hashes = dict((relative, checksum) for checksum, relative in (
+                line.split("  ", 1) for line in archive.read(prefix + "SHA256SUMS.txt").decode().splitlines()))
+        self.assertEqual(hashlib.sha256(published).hexdigest(), hashes["repair_distillation_roundtrip.py"])
+        targets = [node.value.value for node in ast.parse(published.decode()).body
+                   if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                   and any(isinstance(name, ast.Name) and name.id == "TARGET_SHA256" for name in node.targets)]
+        self.assertEqual(len(targets), 1)
+        repaired = updater._build(self.original)
+        self.assertEqual(updater.TARGET_SHA256, targets[0])
+        self.assertEqual(hashlib.sha256(repaired).hexdigest(), targets[0])
+        compile(repaired, updater.CORE, "exec")
 
     def test_preview_creates_no_backup_or_lock_and_preserves_every_result(self):
         result = updater.repair(self.project)
