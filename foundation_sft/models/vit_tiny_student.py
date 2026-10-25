@@ -214,6 +214,11 @@ class ViTTinyStudent(nn.Module):
         if cuda and self._drop_path_cuda_state is None:
             self._drop_path_cuda_state = torch.Generator(device=images.device).manual_seed(
                 self._drop_path_seed).get_state().cpu()
+        if cuda:
+            # A CPU-loaded checkpoint may contain a CUDA stream produced by a
+            # different runtime. Let the target backend validate its own bytes.
+            self._drop_path_cuda_state = self._validated_cuda_state(
+                self._drop_path_cuda_state, images.device)
         with torch.random.fork_rng(devices=[index] if cuda else []):
             torch.set_rng_state(self._drop_path_cpu_state)
             if cuda:
@@ -250,6 +255,20 @@ class ViTTinyStudent(nn.Module):
                 "cuda": self._drop_path_cuda_state.cpu().clone()
                     if self._drop_path_cuda_state is not None else None}
 
+    def _validated_cuda_state(self, state, device):
+        """Validate opaque CUDA state using an independent target-device RNG."""
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError("DropPath CUDA RNG validation requires a CUDA target")
+        probe = torch.Generator(device=device)
+        try:
+            probe.set_state(state)
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise ValueError("DropPath CUDA RNG state cannot be restored by this runtime") from error
+        if probe.initial_seed() != self._drop_path_seed:
+            raise ValueError("DropPath CUDA RNG state belongs to a different seed")
+        return probe.get_state().cpu().clone()
+
     def load_stochastic_state_dict(self, state):
         """Restore future masks without changing the caller's random streams."""
         if not self.drop_path_rate:
@@ -266,7 +285,7 @@ class ViTTinyStudent(nn.Module):
                 continue
             if (not isinstance(value, torch.Tensor) or value.dtype != torch.uint8
                     or value.device.type != "cpu" or value.layout != torch.strided
-                    or value.ndim != 1 or not 0 < value.numel() <= 65536):
+                    or value.ndim != 1 or value.numel() == 0):
                 raise ValueError("Invalid DropPath " + name + " RNG state")
         probe = torch.Generator(device="cpu")
         try:
@@ -276,13 +295,11 @@ class ViTTinyStudent(nn.Module):
         if probe.initial_seed() != self._drop_path_seed:
             raise ValueError("DropPath CPU RNG state belongs to a different seed")
         cuda_state = state["cuda"]
-        if cuda_state is not None:
-            # This format stores CUDA Philox's uint64 seed and int64 offset.
-            if cuda_state.numel() != 16:
-                raise ValueError("Invalid DropPath CUDA RNG state length")
-            cuda_seed = int.from_bytes(bytes(cuda_state[:8].tolist()), byteorder="little", signed=False)
-            if cuda_seed != self._drop_path_seed:
-                raise ValueError("DropPath CUDA RNG state belongs to a different seed")
+        device = self.encoder.head.weight.device
+        if cuda_state is not None and device.type == "cuda":
+            cuda_state = self._validated_cuda_state(cuda_state, device)
+        # CPU inference must not initialize an unrelated GPU. Preserve CUDA
+        # state opaquely; a future CUDA training forward validates on its target.
         self._drop_path_cpu_state = state["cpu"].clone()
         self._drop_path_cuda_state = cuda_state.clone() if cuda_state is not None else None
 

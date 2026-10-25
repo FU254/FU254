@@ -29,10 +29,20 @@ PREVIOUS_SHA256 = {
     "foundation_sft/distillation.py": "dceb270c7af766d2316968327c46c1c67d58223f8b023ceee1e853f5250879c8",
     "foundation_sft/random_student_distillation.py": "b7d9279addd86a562685a90e9a094c34ae0391d8d8334e37733442b3ce8be6a0"
 }
+# The first DropPath release had a CUDA-state layout compatibility bug. These
+# exact versions are also safe upgrade sources; arbitrary local edits are not.
+KNOWN_PREVIOUS_SHA256 = {
+    "foundation_sft/models/vit_tiny_student.py": (
+        "78cf4cfc978a6bd88ad2ce554fc241d2dec994d64592667ffd5e5515fa8612c2",
+    ),
+    "foundation_sft/distillation.py": (
+        "d4cddbbd5255f87eeeba4eba5b9a1ac5cd3c9d91cc6a8889ef3dba3a1077ca17",
+    ),
+}
 # The package builder freezes the reviewed payload before distribution.
 PAYLOAD_SHA256 = {
-    "foundation_sft/models/vit_tiny_student.py": "78cf4cfc978a6bd88ad2ce554fc241d2dec994d64592667ffd5e5515fa8612c2",
-    "foundation_sft/distillation.py": "d4cddbbd5255f87eeeba4eba5b9a1ac5cd3c9d91cc6a8889ef3dba3a1077ca17",
+    "foundation_sft/models/vit_tiny_student.py": "3795133c413aaad377017fe9b3a2b07f0eefe6f957b0f3ca01a9c18b5dcb2e27",
+    "foundation_sft/distillation.py": "2227117f11d6bed2ed13ae1e3493ff3735f969e58cf9d2f61fa0cc7a47a22893",
     "foundation_sft/random_student_distillation.py": "6cc060695bd0896631660512dd8d839944e714c6d83f754cb621b1f0c87618ab",
     "foundation_sft/droppath_baseline.py": "b39d99c0c564d1be7397e9aee5d4e26a84299701c9d1cdff9d3891d8a89b01f9",
     "foundation_sft/droppath_study.py": "b33d1f5ea8152b2314e05b0892b0c24613a91eaedc955018a485ee1fbab63abf",
@@ -63,6 +73,14 @@ MAX_BYTES = 1024 * 1024
 
 def _digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _accepted_previous_hashes(relative):
+    accepted = set(KNOWN_PREVIOUS_SHA256.get(relative, ()))
+    previous = PREVIOUS_SHA256.get(relative)
+    if previous is not None:
+        accepted.add(previous)
+    return accepted
 
 
 def _require_python():
@@ -120,9 +138,9 @@ def _prepare(project, source):
         previous, mode = _current(_path(project, relative))
         if previous == data:
             continue
-        expected_old = PREVIOUS_SHA256.get(relative)
-        if expected_old is not None:
-            if previous is None or _digest(previous) != expected_old:
+        accepted = _accepted_previous_hashes(relative)
+        if accepted:
+            if previous is None or _digest(previous) not in accepted:
                 raise ValueError("Unknown local changes preserved; no files were updated: " + relative)
         elif previous is not None:
             raise ValueError("Existing file or local changes preserved; no files were updated: " + relative)
@@ -252,7 +270,8 @@ def _rollback_plan(project, backup_dir):
     changes = {}
     for relative, record in files.items():
         previous_sha = record.get("previous_sha256")
-        if previous_sha != PREVIOUS_SHA256.get(relative):
+        accepted = _accepted_previous_hashes(relative)
+        if (previous_sha is None and accepted) or (previous_sha is not None and previous_sha not in accepted):
             raise ValueError("Backup is not a recognized previous code version: " + relative)
         before = _path(backup, "updated/" + relative).read_bytes()
         if _digest(before) != record.get("updated_sha256"):

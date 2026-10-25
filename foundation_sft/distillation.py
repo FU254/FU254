@@ -334,11 +334,14 @@ def load_student_checkpoint(path, device="cpu"):
     if student.training_metadata() != payload["model_metadata"]:
         raise ValueError("Saved student architecture or initialization metadata differs")
     student.load_trainable_state_dict(payload["model"])
+    # Restore a saved CUDA stream against the requested device, never the
+    # default GPU. CPU inference keeps CUDA bytes opaque until CUDA is used.
+    student = student.to(device)
     if regularization is not None:
         student.load_stochastic_state_dict(payload.get("student_stochastic_state"))
     elif "student_stochastic_state" in payload:
         raise ValueError("A zero-DropPath checkpoint must not contain a stochastic-depth stream")
-    return student.to(device).eval(), payload
+    return student.eval(), payload
 
 
 def inference_dataset(cohort, payload, cache_dir=None):

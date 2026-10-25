@@ -164,8 +164,8 @@ class ViTTinyDropPathTests(unittest.TestCase):
             {**original, "cpu": torch.zeros(3, dtype=torch.uint8)},
             {**original, "cpu": torch.Generator().manual_seed(123).get_state()},
             {**original, "cuda": torch.zeros(0, dtype=torch.uint8)},
-            {**original, "cuda": torch.zeros(15, dtype=torch.uint8)},
-            {**original, "cuda": torch.zeros(16, dtype=torch.uint8)}]
+            {**original, "cuda": torch.zeros(16, dtype=torch.float32)},
+            {**original, "cuda": torch.zeros(2, 8, dtype=torch.uint8)}]
         before = torch.get_rng_state().clone()
         for value in mutations:
             with self.subTest(value_type=type(value).__name__), self.assertRaises(ValueError):

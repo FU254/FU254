@@ -113,6 +113,70 @@ class DropPathUpdateTests(unittest.TestCase):
             "foundation_sft/random_student_distillation.py": "b7d9279addd86a562685a90e9a094c34ae0391d8d8334e37733442b3ce8be6a0",
         })
 
+    def test_known_broken_release_hashes_are_limited_to_the_two_fixed_files(self):
+        self.assertEqual(updater.KNOWN_PREVIOUS_SHA256, {
+            "foundation_sft/models/vit_tiny_student.py": (
+                "78cf4cfc978a6bd88ad2ce554fc241d2dec994d64592667ffd5e5515fa8612c2",),
+            "foundation_sft/distillation.py": (
+                "d4cddbbd5255f87eeeba4eba5b9a1ac5cd3c9d91cc6a8889ef3dba3a1077ca17",),
+        })
+
+    def test_known_broken_release_upgrade_and_rollback_restore_exact_source_bytes(self):
+        affected = ("foundation_sft/models/vit_tiny_student.py", "foundation_sft/distillation.py")
+        broken = {name: ("BROKEN_DROPPATH_" + str(index) + " = True\n").encode()
+                  for index, name in enumerate(affected)}
+        for name, data in self.payload.items():
+            self.write(self.project / name, data)
+        for name, data in broken.items():
+            self.write(self.project / name, data)
+            (self.project / name).chmod(0o640)
+        allowed = {name: (updater._digest(data),) for name, data in broken.items()}
+        with patch.object(updater, "KNOWN_PREVIOUS_SHA256", allowed):
+            result = self.install(True)
+            self.assertEqual(set(result["files"]), set(affected))
+            self.assert_preserved()
+            for name in affected:
+                self.assertEqual((self.project / name).read_bytes(), self.payload[name])
+                self.assertEqual((self.project / name).stat().st_mode & 0o777, 0o640)
+            journal = json.loads((Path(result["backup"]) / "installation.json").read_text())
+            for name in affected:
+                self.assertEqual(journal["files"][name]["previous_sha256"], updater._digest(broken[name]))
+            self.assertEqual(self.install(True)["files"], [])
+            updater.rollback(self.project, result["backup"], True)
+            for name, data in broken.items():
+                self.assertEqual((self.project / name).read_bytes(), data)
+                self.assertEqual((self.project / name).stat().st_mode & 0o777, 0o640)
+            for name, data in self.payload.items():
+                if name not in affected:
+                    self.assertEqual((self.project / name).read_bytes(), data)
+            self.assertEqual(updater.rollback(self.project, result["backup"], True)["files"], [])
+
+    def test_mixed_reviewed_legacy_and_broken_versions_can_upgrade_and_roll_back(self):
+        name = "foundation_sft/models/vit_tiny_student.py"
+        broken = b"KNOWN_BROKEN_DROPPATH = True\n"
+        self.write(self.project / name, broken)
+        with patch.object(updater, "KNOWN_PREVIOUS_SHA256", {name: (updater._digest(broken),)}):
+            result = self.install(True)
+            self.assertEqual(len(result["files"]), 9)
+            updater.rollback(self.project, result["backup"], True)
+        self.assertEqual((self.project / name).read_bytes(), broken)
+        for relative, data in self.previous.items():
+            if relative != name:
+                self.assertEqual((self.project / relative).read_bytes(), data)
+        self.assert_preserved()
+
+    def test_rollback_rejects_an_unrecognized_recorded_previous_hash(self):
+        result = self.install(True)
+        journal_path = Path(result["backup"]) / "installation.json"
+        journal = json.loads(journal_path.read_text())
+        journal["files"]["foundation_sft/models/vit_tiny_student.py"]["previous_sha256"] = "f" * 64
+        journal_path.write_text(json.dumps(journal))
+        with self.assertRaisesRegex(ValueError, "recognized previous code version"):
+            updater.rollback(self.project, result["backup"], True)
+        for name, data in self.payload.items():
+            self.assertEqual((self.project / name).read_bytes(), data)
+        self.assert_preserved()
+
     def test_unknown_legacy_edit_preserves_all_files(self):
         relative = "foundation_sft/models/vit_tiny_student.py"
         changed = b"USER_CHANGED_STUDENT = True\n"
