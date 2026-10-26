@@ -21,6 +21,7 @@ from . import train as supervised
 from .distillation_losses import SingleTeacherDistillationLoss
 from .metrics import aggregate_patient_predictions, binary_metrics, save_evaluation, select_threshold
 from .models.vit_tiny_student import build_vit_tiny_student, _strict_load
+from .random_student_profiles import is_soft_only, loss_settings, validate_soft_only
 
 
 EXPERIMENT = "random_student_kd_v1"
@@ -42,7 +43,9 @@ def _validate_config(config):
     rate = config.get("training", {}).get("drop_path_rate", 0.0)
     if type(rate) not in (int, float) or not math.isfinite(rate) or not 0 <= rate < 1:
         raise ValueError("Student drop_path_rate must be finite and in [0,1)")
-    records._same("confirmed three-term distillation", config.get("distillation"), LOSS_SETTINGS)
+    records._same("confirmed random-student distillation", config.get("distillation"),
+                  loss_settings(config, legacy_settings=LOSS_SETTINGS))
+    validate_soft_only(config)
 
 
 def _build_student(config):
@@ -102,7 +105,25 @@ def _payload(student, config, cohort_hash, condition, initial, teacher, geometry
     payload = single._student_payload(student, config, cohort_hash, condition, initial, teacher, geometry)
     payload.update(experiment=EXPERIMENT, student_initialization="random",
                    distillation_initial_state_sha256=distillation_initial)
+    if is_soft_only(config):
+        validate_soft_only(config, condition=condition)
+        payload["distillation_profile"] = config["distillation_profile"]
     return payload
+
+
+def _soft_gradient_proof(student, kd, values):
+    """Check the enabled soft loss itself, independently of the hard-label loss."""
+    if kd.projector is not None or any(True for _ in kd.parameters()):
+        raise RuntimeError("Soft-only KD must not create a feature projector")
+    if values["global"].detach().item() != 0 or values["local"].detach().item() != 0:
+        raise RuntimeError("Disabled global/local losses must be exactly zero")
+    backbone = [p for name, p in student.named_parameters()
+                if p.requires_grad and not name.startswith("encoder.head.")]
+    gradients = torch.autograd.grad(values["soft"], backbone, retain_graph=True, allow_unused=True)
+    if (any(g is not None and not torch.isfinite(g).all().item() for g in gradients)
+            or not any(g is not None and g.abs().sum().item() > 0 for g in gradients)):
+        raise RuntimeError("The enabled soft KD loss received no finite nonzero backbone gradients")
+    return {"soft_kd_gradient_verified": True, "distillation_trainable_parameters": 0}
 
 
 def _roundtrip(student, restored, expected=None, actual=None):
@@ -126,6 +147,7 @@ def _roundtrip(student, restored, expected=None, actual=None):
 def check(config, project, condition="distillation"):
     if condition not in CONDITIONS:
         raise ValueError("Select supervised or distillation")
+    validate_soft_only(config, condition=condition)
     config, teacher, split, info = _prepare(config, project)
     device = supervised._device(config)
     supervised.set_seed(config["seed"])
@@ -144,6 +166,7 @@ def check(config, project, condition="distillation"):
         torch.Generator().manual_seed(config["seed"]), include_teacher=kd is not None)
     batch = next(iter(loader))
     values = single._batch_loss(student, teacher, kd, batch, criterion, device)
+    soft_proof = _soft_gradient_proof(student, kd, values) if is_soft_only(config) else {}
     values["total"].backward()
     gradients = [p.grad for name, p in student.named_parameters() if not name.startswith("encoder.head.")]
     if not any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in gradients):
@@ -176,7 +199,9 @@ def check(config, project, condition="distillation"):
         "initial_state_sha256": initial, "cohort_hash": supervised._split_hash(split),
         "distillation_initial_state_sha256": kd_initial,
         "teacher": info, "shared_view": loader.dataset.metadata(),
-        "losses": {name: value.detach().item() for name, value in values.items()}}
+        "losses": {name: value.detach().item() for name, value in values.items()}, **soft_proof}
+    if is_soft_only(config):
+        result["distillation_profile"] = config["distillation_profile"]
     supervised._json(directory / "check.json", result)
     print(f"Check passed: {condition}; random initialization, backbone backward, frozen teacher, exact student reload", flush=True)
     return directory
@@ -213,6 +238,7 @@ class _ProgressLoader:
 def _run_condition(condition, suite, teacher, split, config, info, expected_initial=None):
     if condition not in CONDITIONS:
         raise ValueError("Select supervised or distillation")
+    validate_soft_only(config, condition=condition)
     run = Path(suite) / condition
     run.mkdir()
     device, train = supervised._device(config), config["training"]
@@ -330,6 +356,8 @@ def _run_condition(condition, suite, teacher, split, config, info, expected_init
         "roc_auc_ci": result["bootstrap"]["patient"].get("roc_auc"), "teacher_unchanged": True,
         "student_trainable_parameters": sum(p.numel() for p in student.parameters() if p.requires_grad),
         "distillation_trainable_parameters": sum(p.numel() for p in kd.parameters() if p.requires_grad) if kd is not None else 0}
+    if is_soft_only(config):
+        receipt["distillation_profile"] = config["distillation_profile"]
     supervised._json(run / "result.json", receipt)
     return receipt
 
@@ -342,6 +370,12 @@ def verify_completed_run(run, check, job, *, checkpoint_loader=None):
     saved = records._read(run / "config.json")
     for config in (saved, check["config"], payload.get("config", {})):
         _validate_config(config)
+        validate_soft_only(config, condition=job["condition"])
+        records._same("random-student loss profile", config.get("distillation_profile"),
+                      saved.get("distillation_profile"))
+    if "config" in job:
+        records._same("requested random-student loss profile", job["config"].get("distillation_profile"),
+                      saved.get("distillation_profile"))
     for metadata in (check["model_metadata"], payload.get("model_metadata", {})):
         _assert_random_metadata(metadata, job["seed"])
     result = records.verify_run(run, check, job, checkpoint_loader=lambda path: payload)
@@ -349,6 +383,11 @@ def verify_completed_run(run, check, job, *, checkpoint_loader=None):
     records._same("checkpoint random experiment", payload.get("experiment"), EXPERIMENT)
     records._same("result random initialization", result.get("student_initialization"), "random")
     records._same("checkpoint random initialization", payload.get("student_initialization"), "random")
+    if is_soft_only(saved):
+        for name, value in (("result", result), ("checkpoint", payload), ("preflight", check)):
+            records._same(name + " soft-only profile", value.get("distillation_profile"),
+                          saved["distillation_profile"])
+        records._same("soft-only trainable KD parameters", result.get("distillation_trainable_parameters"), 0)
     records._same("checkpoint initial projector", payload.get("distillation_initial_state_sha256"),
                   result.get("distillation_initial_state_sha256"))
     if "distillation_initial_state_sha256" in check:

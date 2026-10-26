@@ -20,6 +20,7 @@ import threading
 import uuid
 
 from . import distillation_suite as legacy
+from .random_student_profiles import is_soft_only, loss_settings, validate_soft_only
 
 
 FORMAT = "random_student_suite_v1"
@@ -74,9 +75,11 @@ def make_plan(config_path, project, *, groups=None, seeds=None, devices=None,
     for name in ("backbone_lr", "head_lr", "projection_lr"):
         if type(train.get(name)) not in (int, float) or not math.isfinite(train[name]) or train[name] <= 0:
             raise ValueError(f"training.{name} must be positive and finite")
-    expected_loss = {"temperature": 2.0, "soft_weight": 0.5, "global_weight": 0.1,
-                     "local_weight": 1.0, "pool_grid": [7, 7]}
+    expected_loss = loss_settings(settings)
     legacy._same("matched distillation coefficients", settings.get("distillation"), expected_loss)
+    soft_only = is_soft_only(settings)
+    if soft_only and (selected != ["B"] or chosen_seeds != [42]):
+        raise ValueError("The confirmed soft-only trial adds only groups=['B'], seeds=[42]")
     jobs = []
     for group in selected:
         mode, condition = GROUPS[group]
@@ -89,6 +92,9 @@ def make_plan(config_path, project, *, groups=None, seeds=None, devices=None,
                 "training": deepcopy(train), "distillation": deepcopy(settings["distillation"]),
                 "output_root": settings.get("output_root", "runs/random_student_distillation"),
                 "cache_dir": settings.get("cache_dir")}
+            if soft_only:
+                config["distillation_profile"] = settings["distillation_profile"]
+                validate_soft_only(config, condition=condition)
             if cache_dir is not None:
                 config["cache_dir"] = str(legacy._path(cache_dir, project))
             jobs.append({"id": f"{group}_seed{seed}", "group": group, "seed": seed,
@@ -183,6 +189,14 @@ def _checked(value, job):
     for key, expected in job["config"]["training"].items():
         legacy._same(f"preflight training.{key}", config["training"].get(key), expected)
     legacy._same("preflight distillation coefficients", config.get("distillation"), job["config"]["distillation"])
+    legacy._same("preflight distillation profile", config.get("distillation_profile"),
+                 job["config"].get("distillation_profile"))
+    validate_soft_only(config, condition=job["condition"])
+    if is_soft_only(config):
+        legacy._same("preflight soft-only marker", check.get("distillation_profile"),
+                     config["distillation_profile"])
+        legacy._same("preflight soft gradient proof", check.get("soft_kd_gradient_verified"), True)
+        legacy._same("preflight soft-only projector parameters", check.get("distillation_trainable_parameters"), 0)
     return check
 
 
