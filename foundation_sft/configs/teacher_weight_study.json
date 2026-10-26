@@ -1,0 +1,22 @@
+{
+  "template": "foundation_sft/configs/distillation_rad_dino_vit_tiny.json",
+  "teacher_sources": "foundation_sft/configs/equal_teacher_distillation.json",
+  "output_root": "runs/teacher_weight_study",
+  "student_checkpoint": "foundation_weights/vit_tiny/deit_tiny_patch16_224-a1311bcf.pth",
+  "seeds": [42],
+  "learning_rates": {
+    "random": [0.00005, 0.0001, 0.0003],
+    "imagenet": [0.00001, 0.00003, 0.00005]
+  },
+  "training": {
+    "weight_decay": 0.01,
+    "drop_path_rate": 0.0,
+    "head_lr": 0.0001,
+    "projection_lr": 0.0001,
+    "amp": false
+  },
+  "policy": {},
+  "devices": ["cuda:0"],
+  "max_parallel": 1,
+  "cache_dir": "runs/foundation_sft/data_cache"
+}
