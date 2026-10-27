@@ -172,11 +172,20 @@ def _training_settings(teacher_config, config):
 def _student_options(config):
     """Validate the update mode before loading any large weights or patient data."""
     settings = config.get("student", {})
-    if not isinstance(settings, dict) or set(settings) - {"mode", "rank", "alpha"}:
-        raise ValueError("student must contain only mode, rank and alpha")
+    if not isinstance(settings, dict) or set(settings) - {"mode", "rank", "alpha", "train_last_blocks"}:
+        raise ValueError("student contains an unsupported update option")
     mode = settings.get("mode", "full_finetune")
+    if mode == "partial_finetune":
+        if set(settings) - {"mode", "train_last_blocks"}:
+            raise ValueError("A partial student accepts only mode and train_last_blocks")
+        count = settings.get("train_last_blocks")
+        if type(count) is not int or count not in (2, 4, 8):
+            raise ValueError("student.train_last_blocks must be 2, 4 or 8")
+        return {"mode": mode, "train_last_blocks": count}
     if mode not in ("full_finetune", "lora"):
-        raise ValueError("student.mode must be full_finetune or lora")
+        raise ValueError("student.mode must be full_finetune, lora or partial_finetune")
+    if "train_last_blocks" in settings:
+        raise ValueError("train_last_blocks requires student.mode=partial_finetune")
     rank, alpha = settings.get("rank", 8), settings.get("alpha", 16.0)
     if type(rank) is not int or rank <= 0:
         raise ValueError("student.rank must be a positive integer")
@@ -328,6 +337,16 @@ def load_student_checkpoint(path, device="cpu"):
         saved = metadata.get("lora", {})
         options.update(_student_options({"student": {"mode": mode, "rank": saved.get("rank"),
                                                      "alpha": saved.get("alpha")}}))
+        student = build_vit_tiny_student(initialization=metadata["initialization"], **options)
+    elif mode == "partial_finetune":
+        saved = metadata.get("partial_finetune", {})
+        if not isinstance(saved, dict):
+            raise ValueError("Saved partial student scope must be a dictionary")
+        partial = _student_options({"student": {"mode": mode,
+            "train_last_blocks": saved.get("train_last_blocks")}})
+        if _student_options(payload.get("config", {})) != partial:
+            raise ValueError("Checkpoint partial update configuration and metadata differ")
+        options.update(partial)
         student = build_vit_tiny_student(initialization=metadata["initialization"], **options)
     else:
         raise ValueError("Unsupported saved student update mode")

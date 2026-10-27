@@ -53,8 +53,11 @@ def _validate_config(config):
         raise ValueError("LR pilots use the common equal-teacher reference")
     if type(config.get("seed")) is not int or config["seed"] != 42:
         raise ValueError("This confirmed teacher-weight study uses seed42")
-    if single._student_options(config)["mode"] != "full_finetune":
-        raise ValueError("The teacher-weight comparison fully trains the same student")
+    options = single._student_options(config)
+    if options["mode"] not in {"full_finetune", "partial_finetune"}:
+        raise ValueError("The teacher-weight worker supports full or partial students")
+    if options["mode"] == "partial_finetune" and config["student_initialization"] != "imagenet":
+        raise ValueError("Partial fine-tuning requires the ImageNet-initialized student")
     records._same("fixed three-term KD", config.get("distillation"), LOSS_SETTINGS)
     train = config.get("training", {})
     for key, expected in (("weight_decay", .01), ("drop_path_rate", 0.)):
@@ -114,8 +117,11 @@ def _head_protocol(seed):
 
 
 def _build_student(config):
+    options = single._student_options(config)
     if config["student_initialization"] == "random":
         student = build_vit_tiny_student(random_seed=config["seed"])
+    elif options["mode"] == "partial_finetune":
+        student = build_vit_tiny_student(config["student_checkpoint"], **options)
     else:
         student = build_vit_tiny_student(config["student_checkpoint"])
     # The ImageNet encoder and random encoder receive identical task-head
@@ -143,10 +149,51 @@ def _projector_hash(kd):
 
 
 def _initial_proof(student, kd, config):
-    return {"initial_state_sha256": single._state_hash(student.state_dict()),
+    proof = {"initial_state_sha256": single._state_hash(student.state_dict()),
         "head_initial_state_sha256": single._state_hash(student.encoder.head.state_dict()),
         "distillation_initial_state_sha256": _projector_hash(kd),
         "head_initialization": _head_protocol(config["seed"])}
+    if single._student_options(config)["mode"] == "partial_finetune":
+        frozen = {name: value for name, value in student.named_parameters() if not value.requires_grad}
+        trainable = [name for name, value in student.named_parameters() if value.requires_grad]
+        if not frozen or not trainable:
+            raise ValueError("Partial student requires both frozen and trainable parameters")
+        proof.update(frozen_parameter_sha256=single._state_hash(frozen),
+            student_frozen_parameter_names=sorted(frozen), student_trainable_parameter_names=sorted(trainable))
+    return proof
+
+
+def _assert_partial_frozen(student, proof):
+    """Verify exact frozen tensors and the complete trainable scope."""
+    if "frozen_parameter_sha256" not in proof:
+        return
+    frozen = {name: value for name, value in student.named_parameters() if not value.requires_grad}
+    trainable = sorted(name for name, value in student.named_parameters() if value.requires_grad)
+    records._same("partial frozen parameter names", sorted(frozen), proof["student_frozen_parameter_names"])
+    records._same("partial trainable parameter names", trainable, proof["student_trainable_parameter_names"])
+    records._same("partial frozen parameter values", single._state_hash(frozen), proof["frozen_parameter_sha256"])
+    if any(parameter.grad is not None for parameter in frozen.values()):
+        raise RuntimeError("Frozen student parameters received gradients")
+
+
+def _partial_checkpoint_proof(payload):
+    """Frozen parameters remain exact in every complete partial checkpoint."""
+    if single._student_options(payload["config"])["mode"] != "partial_finetune":
+        return
+    frozen = payload.get("student_frozen_parameter_names")
+    trainable = payload.get("student_trainable_parameter_names")
+    for names in (frozen, trainable):
+        if not isinstance(names, list) or not names or any(not isinstance(n, str) for n in names):
+            raise ValueError("Partial checkpoint requires explicit frozen and trainable names")
+        if names != sorted(set(names)):
+            raise ValueError("Partial checkpoint parameter names must be unique and sorted")
+    if set(frozen) & set(trainable):
+        raise ValueError("Partial checkpoint parameter scopes overlap")
+    model = payload.get("model", {})
+    if set(model) != set(frozen) | set(trainable):
+        raise ValueError("Partial checkpoint does not contain its complete student state")
+    records._same("partial checkpoint frozen values",
+        single._state_hash({name: model[name] for name in frozen}), payload.get("frozen_parameter_sha256"))
 
 
 def _cpu_tree(value):
@@ -301,6 +348,19 @@ def check(config, project):
     # Active epoch exercises learned/sample-conditioned weights in preflight;
     # actual training retains the common equal-weight first epoch.
     values = _batch_loss(student, teachers, kd, batch, criterion, device, 2, config["training"]["epochs"])
+    partial = single._student_options(config)["mode"] == "partial_finetune"
+    feature_proof = {}
+    if partial:
+        parameters = [p for name, p in student.named_parameters()
+                      if p.requires_grad and name.startswith("encoder.blocks.")]
+        for name in ("soft", "global", "local"):
+            gradients = torch.autograd.grad(values[name], parameters, retain_graph=True, allow_unused=True)
+            if not any(g is not None and torch.isfinite(g).all().item() and g.abs().sum().item() > 0
+                       for g in gradients):
+                raise RuntimeError(f"Partial student backbone received no finite {name} KD gradient")
+            if any(g is not None and not torch.isfinite(g).all().item() for g in gradients):
+                raise RuntimeError(f"Partial student has non-finite {name} KD gradients")
+            feature_proof[name] = True
     values["total"].backward()
     backbone = [p.grad for name, p in student.named_parameters() if "encoder.head." not in name and p.requires_grad]
     if not any(g is not None and torch.isfinite(g).all().item() and g.abs().sum().item() > 0 for g in backbone):
@@ -321,6 +381,19 @@ def check(config, project):
         if any(g is not None and not torch.isfinite(g).all().item() for g in gradients):
             raise RuntimeError("RL policy preflight produced non-finite gradients")
         actor_verified = True
+    if partial:
+        _assert_partial_frozen(student, proof)
+        backbone_before = single._state_hash({name: p for name, p in student.named_parameters()
+            if p.requires_grad and name.startswith("encoder.blocks.")})
+        optimizer = _optimizer(student, kd, config["training"])
+        nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group["params"]],
+                                config["training"]["gradient_clip"], error_if_nonfinite=True)
+        optimizer.step()
+        _assert_partial_frozen(student, proof)
+        backbone_after = single._state_hash({name: p for name, p in student.named_parameters()
+            if p.requires_grad and name.startswith("encoder.blocks.")})
+        if backbone_before == backbone_after:
+            raise RuntimeError("Partial student backbone did not change after the preflight optimizer step")
     equal._assert_frozen(teachers)
     for name, teacher in teachers.items():
         if before[name] != single._state_hash(teacher.state_dict()):
@@ -344,7 +417,7 @@ def check(config, project):
         restored_kd.load_stochastic_state_dict(payload["distillation_stochastic_state"])
     snapshot.unlink()
     result = {"check_passed": True, "training_started": False, "condition": CONDITION,
-        "experiment": EXPERIMENT, "student_mode": "full_finetune", "seed": config["seed"],
+        "experiment": EXPERIMENT, "student_mode": single._student_options(config)["mode"], "seed": config["seed"],
         "student_initialization": config["student_initialization"], "method": config["method"], "phase": config["phase"],
         "teacher_unchanged": True, "student_backbone_gradient_verified": True,
         "projector_gradients_verified": True, "policy_gradient_verified": actor_verified,
@@ -354,6 +427,9 @@ def check(config, project):
         "losses": {key: values[key].detach().item() for key in ("total", "hard", "kd", "soft", "global", "local")},
         "weights": values["weights"].detach().cpu().tolist(),
         "weighting_metadata": kd.weighting_metadata(), **proof, **roundtrip}
+    if partial:
+        result.update(partial_frozen_state_verified=True, partial_optimizer_step_verified=True,
+                      feature_kd_gradients_verified=feature_proof)
     supervised._json(directory / "check.json", result)
     print(f"Check passed: {config['student_initialization']} / {config['method']} / {config['phase']}", flush=True)
     return directory
@@ -431,6 +507,9 @@ def _run_training(config, teachers, split, infos, anchor):
         else:
             bad_epochs += 1
         history.append(_history_record(epoch, started, losses, training_metrics, train_eval_loss, metrics, val_loss, optimizer))
+        _assert_partial_frozen(student, proof)
+        if "frozen_parameter_sha256" in proof:
+            history[-1]["partial_frozen_state_verified"] = True
         print(json.dumps({"method": config["method"], "student_initialization": config["student_initialization"], **history[-1]}), flush=True)
         scheduler.step()
         payload = _payload(student, kd, config, proof, anchor, geometry, infos, views, cohort_hash, files)
@@ -450,6 +529,7 @@ def _run_training(config, teachers, split, infos, anchor):
     supervised._json(run / "history_plot_metadata.json", {"train_loss": "train_eval_loss: Focal, eval mode, no random augmentation",
         "val_loss": "val_loss: Focal, eval mode", "optimization_losses": "Preserved separately in history.json"})
     student.load_trainable_state_dict(best_model)
+    _assert_partial_frozen(student, proof)
     _strict_load(kd, best_kd, "Validation-selected KD and policy")
     if best_rng is not None:
         kd.load_stochastic_state_dict(best_rng)
@@ -472,7 +552,7 @@ def _run_training(config, teachers, split, infos, anchor):
         teacher.to("cpu")
     receipt = {"status": "completed", "experiment": EXPERIMENT, "condition": CONDITION,
         "phase": config["phase"], "method": config["method"], "student_initialization": config["student_initialization"],
-        "seed": config["seed"], "student_mode": "full_finetune", "run": str(run),
+        "seed": config["seed"], "student_mode": single._student_options(config)["mode"], "run": str(run),
         "best_val_patient_roc_auc": best_auc, "val_patient_pr_auc": best_record["val_patient_pr_auc"],
         "best_epoch": best_record["epoch"], "threshold": threshold, "cohort_hash": cohort_hash,
         "teacher_unchanged": True, "teachers": infos, "teacher_views": views, "data_files": files,
@@ -481,6 +561,8 @@ def _run_training(config, teachers, split, infos, anchor):
         "distillation_trainable_parameters": sum(p.numel() for p in kd.projector_parameters()),
         "policy_trainable_parameters": sum(p.numel() for p in kd.policy_parameters()), **proof}
     receipt["weighting_metadata"] = kd.weighting_metadata()
+    if "frozen_parameter_sha256" in proof:
+        receipt["partial_frozen_state_verified"] = True
     # A pilot is a completed train/validation experiment. It never constructs a
     # test loader, reads test pixels, or stores test metrics.
     supervised._json(run / "result.json", receipt)
@@ -512,6 +594,7 @@ def _read_run(run, *, checkpoint_loader=None):
     payload = (checkpoint_loader or records._default_checkpoint_loader)(run / "best.pt")
     config = records._read(run / "config.json")
     _validate_config(config)
+    _partial_checkpoint_proof(payload)
     records._same("worker experiment", payload.get("experiment"), EXPERIMENT)
     _protocol(payload["config"], config)
     files = _data_files(run)
@@ -526,6 +609,8 @@ def _read_run(run, *, checkpoint_loader=None):
             value = row.get(key)
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError("Missing or invalid comparable history field " + key)
+        if single._student_options(config)["mode"] == "partial_finetune":
+            records._same("epoch frozen student verification", row.get("partial_frozen_state_verified"), True)
     best = max(history, key=lambda row: row["val_patient_roc_auc"])
     records._same("saved validation best", payload.get("best_val_patient_roc_auc"), best["val_patient_roc_auc"])
     records._same("saved best epoch", payload.get("best_epoch"), best["epoch"])
@@ -613,6 +698,12 @@ def verify_completed_run(run, check, job, *, checkpoint_loader=None):
     for key in ("initial_state_sha256", "head_initial_state_sha256", "distillation_initial_state_sha256", "head_initialization"):
         records._same("preflight " + key, check.get(key), payload.get(key))
         records._same("result " + key, result.get(key), payload.get(key))
+    if single._student_options(saved)["mode"] == "partial_finetune":
+        records._same("partial result student mode", result.get("student_mode"), "partial_finetune")
+        for key in ("frozen_parameter_sha256", "student_frozen_parameter_names", "student_trainable_parameter_names"):
+            records._same("partial preflight " + key, check.get(key), payload.get(key))
+            records._same("partial result " + key, result.get(key), payload.get(key))
+        records._same("partial result frozen verification", result.get("partial_frozen_state_verified"), True)
     for key in ("model_metadata", "teacher", "teachers", "teacher_views", "shared_view", "cohort_hash"):
         records._same("preflight " + key, check.get(key), payload.get(key))
     for key in ("method", "student_initialization", "phase"):

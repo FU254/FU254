@@ -1,4 +1,4 @@
-"""Single-CLS DeiT-Tiny/16 student with full or LoRA training, always offline.
+"""Single-CLS DeiT-Tiny/16 student with full, partial or LoRA tuning, offline.
 
 Fresh training::
 
@@ -6,6 +6,10 @@ Fresh training::
 
     # Optional: freeze the ImageNet base and train QKV LoRA plus a linear head.
     model = build_vit_tiny_student("deit_tiny_patch16_224-a1311bcf.pth", mode="lora")
+
+    # Optional: preserve ImageNet embeddings/early blocks, tune the last four.
+    model = build_vit_tiny_student("deit_tiny_patch16_224-a1311bcf.pth",
+                                  mode="partial_finetune", train_last_blocks=4)
 
     # Explicitly train from random weights; no source checkpoint is accessed.
     model = build_vit_tiny_student(random_seed=42)
@@ -19,7 +23,8 @@ Evaluation/resume from a saved student needs no original ImageNet file::
 The second form cannot run forward until the complete student state is loaded.
 Save ``training_metadata()`` and the complete ``trainable_state_dict()`` together.
 For LoRA reconstruction, also pass the saved mode, LoRA rank and alpha to the
-factory. Both modes save the entire encoder, so neither needs its source file.
+factory. For partial reconstruction, pass the saved mode and train_last_blocks.
+All modes save the entire encoder, so none needs its source file.
 Random initialization is recorded separately from ImageNet initialization and
 does not change the caller's Torch random-number state.
 """
@@ -59,14 +64,37 @@ def _drop_path_context(rate, initialization, mode):
         raise ValueError("Positive DropPath requires a random, fully trained student")
 
 
-def _validate_training(mode, rank, alpha):
-    if mode not in ("full_finetune", "lora"):
-        raise ValueError("Student mode must be full_finetune or lora")
+def _validate_training(mode, rank, alpha, train_last_blocks=None):
+    if mode not in ("full_finetune", "partial_finetune", "lora"):
+        raise ValueError("Student mode must be full_finetune, partial_finetune or lora")
+    if mode == "partial_finetune":
+        if type(train_last_blocks) is not int or train_last_blocks not in (2, 4, 8):
+            raise ValueError("Partial fine-tuning requires train_last_blocks=2, 4 or 8")
+    elif train_last_blocks is not None:
+        raise ValueError("train_last_blocks is only valid for partial_finetune")
     if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
         raise ValueError("Student LoRA rank must be a positive integer")
     if (isinstance(alpha, bool) or not isinstance(alpha, (int, float))
             or not math.isfinite(alpha) or alpha <= 0):
         raise ValueError("Student LoRA alpha must be positive and finite")
+
+
+def _partial_context(mode, initialization):
+    if mode == "partial_finetune" and initialization.get("pretraining") != "ImageNet-1k":
+        raise ValueError("Partial fine-tuning requires the ImageNet-pretrained student")
+
+
+def _partial_metadata(train_last_blocks):
+    first = 12 - train_last_blocks
+    return {
+        "train_last_blocks": train_last_blocks,
+        "total_blocks": 12,
+        "trainable_block_indices": list(range(first, 12)),
+        "frozen_block_indices": list(range(first)),
+        "frozen_embeddings": ["patch_embed", "cls_token", "pos_embed"],
+        "trainable_modules": [f"encoder.blocks.{index}" for index in range(first, 12)]
+                             + ["encoder.norm", "encoder.head"],
+    }
 
 
 def _validate_initialization(initialization):
@@ -160,16 +188,17 @@ def _new_encoder(num_classes, drop_path_rate=0.0):
 
 
 class ViTTinyStudent(nn.Module):
-    """One linear output head, with full encoder tuning or QKV LoRA tuning."""
+    """One output head with full, last-block partial, or QKV LoRA tuning."""
 
     def __init__(self, encoder, initialization, *, ready, mode="full_finetune", rank=8, alpha=16.0,
-                 drop_path_rate=0.0):
+                 drop_path_rate=0.0, train_last_blocks=None):
         super().__init__()
-        _validate_training(mode, rank, alpha)
+        _validate_training(mode, rank, alpha, train_last_blocks)
         self.encoder = encoder
         self.feature_dim = FEATURE_DIM
         self.preprocess = PreprocessSpec(IMAGE_SIZE)
         self.initialization = _validate_initialization(initialization)
+        _partial_context(mode, self.initialization)
         self.drop_path_rate = _validate_drop_path(drop_path_rate)
         _drop_path_context(self.drop_path_rate, self.initialization, mode)
         self._drop_path_seed = None
@@ -180,8 +209,18 @@ class ViTTinyStudent(nn.Module):
         self._ready = ready
         self.training_mode = mode
         self.lora = None
+        self.partial_finetune = None
         if mode == "full_finetune":
             self.requires_grad_(True)
+        elif mode == "partial_finetune":
+            if len(self.encoder.blocks) != 12:
+                raise ValueError("Partial fine-tuning requires exactly twelve Transformer blocks")
+            self.encoder.requires_grad_(False)
+            for block in self.encoder.blocks[-train_last_blocks:]:
+                block.requires_grad_(True)
+            self.encoder.norm.requires_grad_(True)
+            self.encoder.head.requires_grad_(True)
+            self.partial_finetune = _partial_metadata(train_last_blocks)
         else:
             self.encoder.requires_grad_(False)
             targets = inject_lora(self, rank=rank, alpha=alpha)
@@ -328,6 +367,8 @@ class ViTTinyStudent(nn.Module):
         # Preserve the exact legacy full-finetune metadata schema.
         if self.lora is not None:
             metadata["lora"] = deepcopy(self.lora)
+        if self.partial_finetune is not None:
+            metadata["partial_finetune"] = deepcopy(self.partial_finetune)
         if self.drop_path_rate:
             metadata["regularization"] = {"drop_path_rate": self.drop_path_rate,
                 "schedule": "linear_12_blocks", "rng": "isolated_torch", "rng_seed": self._drop_path_seed}
@@ -335,7 +376,8 @@ class ViTTinyStudent(nn.Module):
 
 
 def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=None,
-                           mode="full_finetune", rank=8, alpha=16.0, drop_path_rate=0.0):
+                           mode="full_finetune", rank=8, alpha=16.0, drop_path_rate=0.0,
+                           train_last_blocks=None):
     """Build from ImageNet, explicit random weights, or saved metadata, offline.
 
     ``checkpoint`` is the original 1000-class single-CLS release, verified by
@@ -344,6 +386,9 @@ def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=
     a subsequent strict ``load_trainable_state_dict`` of the complete student.
     ``mode='lora'`` freezes original weights and trains QKV adapters plus the
     one-logit linear head. Pass the saved mode/rank/alpha when reconstructing it.
+    ``mode='partial_finetune', train_last_blocks=2|4|8`` freezes ImageNet input
+    embeddings and early blocks; only the last blocks, final norm and head are
+    trained. Pass the same scope when reconstructing a saved complete student.
     ``random_seed`` creates a ready-to-train random student without reading a
     checkpoint. Its seed applies to the encoder, head and any LoRA parameters;
     it leaves the caller's CPU and CUDA random-number states unchanged.
@@ -353,11 +398,13 @@ def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=
     fully trained students. Save its separate stochastic state alongside weights
     when the future training mask sequence must be reproduced.
     """
-    _validate_training(mode, rank, alpha)
+    _validate_training(mode, rank, alpha, train_last_blocks)
     drop_path_rate = _validate_drop_path(drop_path_rate)
     if sum(value is not None for value in (checkpoint, initialization, random_seed)) != 1:
         raise ValueError("Provide either an official checkpoint, saved initialization metadata, or random_seed (exactly one)")
     if random_seed is not None:
+        if mode == "partial_finetune":
+            raise ValueError("Partial fine-tuning requires the ImageNet-pretrained student")
         seed = _validate_random_seed(random_seed)
         metadata = {
             "architecture": ARCHITECTURE,
@@ -374,13 +421,14 @@ def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=
             torch.random.default_generator.manual_seed(seed)
             encoder = _new_encoder(1, drop_path_rate) if drop_path_rate else _new_encoder(1)
             return ViTTinyStudent(encoder, metadata, ready=True, mode=mode, rank=rank, alpha=alpha,
-                                  drop_path_rate=drop_path_rate)
+                                  drop_path_rate=drop_path_rate, train_last_blocks=train_last_blocks)
     if initialization is not None:
         initialization = _validate_initialization(initialization)
+        _partial_context(mode, initialization)
         _drop_path_context(drop_path_rate, initialization, mode)
         encoder = _new_encoder(1, drop_path_rate) if drop_path_rate else _new_encoder(1)
         return ViTTinyStudent(encoder, initialization, ready=False, mode=mode, rank=rank, alpha=alpha,
-                             drop_path_rate=drop_path_rate)
+                             drop_path_rate=drop_path_rate, train_last_blocks=train_last_blocks)
 
     if drop_path_rate:
         raise ValueError("Positive DropPath requires a random, fully trained student")
@@ -406,4 +454,5 @@ def build_vit_tiny_student(checkpoint=None, *, initialization=None, random_seed=
         "source_num_classes": 1000,
         "variant": "single_cls",
     }
-    return ViTTinyStudent(encoder, initialization, ready=True, mode=mode, rank=rank, alpha=alpha)
+    return ViTTinyStudent(encoder, initialization, ready=True, mode=mode, rank=rank, alpha=alpha,
+                         train_last_blocks=train_last_blocks)

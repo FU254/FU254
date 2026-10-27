@@ -1,0 +1,9 @@
+{
+  "source_study": "runs/teacher_weight_study/studies/study_20261026T134529Z_e3d7615f",
+  "seeds": [42],
+  "train_last_blocks": [8, 4, 2],
+  "devices": ["cuda:0", "cuda:3", "cuda:4"],
+  "max_parallel": 3,
+  "cache_dir": "runs/foundation_sft/data_cache",
+  "output_root": "runs/partial_finetune_study"
+}
