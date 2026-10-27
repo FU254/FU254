@@ -296,11 +296,72 @@ class TeacherWeightParallelTests(unittest.TestCase):
             self.execute()
         self.assertEqual(len(self.calls()), 1)
 
+    def test_completed_receipt_precedes_lingering_helper_process_scan(self):
+        result = self.execute()
+        checks_before = self.check_counter.read_bytes()
+        receipt_file = self.path / 'jobs/P-R/old_queue_after_helper/result.json'
+        scanner = mock.Mock(side_effect=AssertionError(
+            'verified completion must be adopted before scanning a finishing helper'))
+        with redirect_stdout(io.StringIO()):
+            adopted = parallel.run_parallel(self.plan(), origin='coordinator',
+                check_runner=self.check, train_runner=self.train,
+                verifier=self.verify, process_scanner=scanner,
+                result_file=receipt_file)
+        self.assertEqual(adopted, result)
+        self.assertEqual(json.loads(receipt_file.read_text()), result)
+        scanner.assert_not_called()
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.check_counter.read_bytes(), checks_before)
+        self.assertEqual(self.state_path.read_bytes(), self.saved_state)
+        self.assertEqual(self.active_log.read_text(), 'epoch 11 started\n')
+
+    def test_corrupt_completed_receipt_rejected_before_lingering_helper_scan(self):
+        result = self.execute()
+        (Path(result['run']) / 'best.pt').write_bytes(b'changed after completion')
+        scanner = mock.Mock(side_effect=AssertionError(
+            'corrupt completion must fail verification before any process scan'))
+        with redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'fingerprint'):
+            parallel.run_parallel(self.plan(), origin='coordinator',
+                check_runner=self.check, train_runner=self.train,
+                verifier=self.verify, process_scanner=scanner)
+        scanner.assert_not_called()
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.state_path.read_bytes(), self.saved_state)
+
+    def test_real_finishing_helper_pid_does_not_block_verified_completion(self):
+        result = self.execute()
+        # Model a helper after it released the lease and removed its marker,
+        # while its process is still alive finishing console output.
+        finishing = subprocess.Popen([sys.executable, '-c',
+            'import time; time.sleep(30)',
+            str(self.base.repo / 'run_teacher_weight_parallel.py'),
+            '--study',str(self.path), '--group','P-R'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        try:
+            active = parallel.active_unguarded_workers(self.path, 'P-R')
+            self.assertIn(finishing.pid, [item['pid'] for item in active])
+            with redirect_stdout(io.StringIO()):
+                adopted = parallel.run_parallel(self.plan(), origin='coordinator',
+                    check_runner=self.check, train_runner=self.train,
+                    verifier=self.verify,
+                    process_scanner=parallel.active_unguarded_workers)
+            self.assertEqual(adopted, result)
+            self.assertIsNone(finishing.poll())
+            self.assertEqual(len(self.calls()), 1)
+            self.assertEqual(self.state_path.read_bytes(), self.saved_state)
+        finally:
+            if finishing.poll() is None:
+                finishing.terminate()
+            finishing.wait(timeout=5)
+
     def test_preexisting_unguarded_target_worker_blocks_new_training(self):
+        scanner = mock.Mock(return_value=[{'pid':1234, 'config':'existing target worker'}])
         with self.assertRaises((ValueError, RuntimeError)):
             parallel.run_parallel(self.plan(), check_runner=self.check,
                 train_runner=self.train, verifier=self.verify,
-                process_scanner=lambda *_:[{'pid':1234, 'config':'existing target worker'}])
+                process_scanner=scanner)
+        scanner.assert_called_once_with(str(self.path), 'P-R')
         self.assertEqual(self.calls(), [])
         self.assertEqual(self.state_path.read_bytes(), self.saved_state)
 

@@ -4,8 +4,12 @@ from copy import deepcopy
 import io
 import json
 from pathlib import Path
+import types
 from unittest import mock
 import unittest
+import zipfile
+import recover_teacher_weight_result as recovery
+import foundation_sft
 
 from foundation_sft import teacher_weight_parallel as parallel
 from foundation_sft import teacher_weight_study as control
@@ -111,6 +115,43 @@ class TeacherWeightParallelIntegrationTests(unittest.TestCase):
             self.assertEqual((run / name).read_bytes(), value, name)
         self.assertEqual((self.study / 'study.json').read_bytes(), self.state_bytes)
         self.assertEqual(self.pc_log.read_text(), 'epoch 11 continues on cuda:0\n')
+        # Reproduce the server's failed parent handoff while the actual RL
+        # model, policy and test artifacts are already complete. The repair
+        # must verify those artifacts and register them without calling any
+        # GPU/optimization/evaluation entry point.
+        state = json.loads((self.study / 'study.json').read_text())
+        state['main']['P-C']['status'] = 'completed'
+        state['main']['P-R'].update(status='failed', error='lingering helper was misclassified')
+        state['status'] = 'partial'
+        (self.study / 'study.json').write_text(json.dumps(state))
+        before_recovery = (self.study / 'study.json').read_bytes()
+        untouched = {name: deepcopy(value) for name, value in state['main'].items() if name != 'P-R'}
+        # Exercise the exact previously shipped module, not just the fixed
+        # source tree. Users can recover without replacing any training file.
+        legacy = types.ModuleType('foundation_sft._legacy_teacher_weight_parallel')
+        legacy.__package__ = 'foundation_sft'
+        legacy.__file__ = str(Path(__file__).resolve().parents[1] / 'foundation_sft/teacher_weight_parallel.py')
+        with zipfile.ZipFile(Path(__file__).resolve().parents[1] / 'packages/FU254-teacher-weight-parallel.zip') as archive:
+            source = archive.read('teacher_weight_parallel_update/foundation_sft/teacher_weight_parallel.py')
+        exec(compile(source, '<previously shipped parallel module>', 'exec'), legacy.__dict__)
+        with redirect_stdout(io.StringIO()), \
+                mock.patch.object(foundation_sft, 'teacher_weight_parallel', legacy), \
+                mock.patch.object(legacy, 'run_parallel', side_effect=AssertionError('legacy training path entered')), \
+                mock.patch.object(parallel, 'run_parallel', side_effect=AssertionError('training path entered')), \
+                mock.patch.object(parallel, '_default_check', side_effect=AssertionError('GPU check entered')), \
+                mock.patch.object(worker, 'evaluate_selected', side_effect=AssertionError('test reevaluated')):
+            recovered = recovery.recover(self.study, project=self.project,
+                expected_checkpoint_sha256=result['checkpoint_sha256'], reporter=lambda *_: None)
+        self.assertEqual(recovered['status'], 'completed')
+        self.assertEqual(recovered['main']['P-R']['status'], 'resumed')
+        self.assertEqual(recovered['main']['P-R']['result'], result)
+        self.assertEqual({name: value for name, value in recovered['main'].items() if name != 'P-R'}, untouched)
+        backups = list(self.study.glob('study.json.before_result_recovery_*.bak'))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), before_recovery)
+        for name, value in preserved.items():
+            self.assertEqual((run / name).read_bytes(), value, name)
+        self.assertEqual(calls, ['optimization'])
         self.training.base.assert_teachers_unchanged()
 
 

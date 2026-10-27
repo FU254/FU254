@@ -316,9 +316,10 @@ def run_parallel(plan, *, origin="parallel", check_runner=None, train_runner=Non
                           plan["project"], allow_running=True)
         records._same("locked parallel launch recipe", _job_hash(fresh), _job_hash(plan))
         control._audit_checks(plan["check"], fresh["all_checks"])
-        active = scanner(plan["study"], plan["group"])
-        if active:
-            raise ValueError(f"This group already has an unguarded live training worker; keep it running: {active}")
+        # A completed helper releases this lease before its final print/exit.
+        # Its marker can already be gone while its PID is still visible. A
+        # verified completed receipt is safe to adopt in that window; process
+        # exclusion is needed only when a new optimization would be started.
         result = _load_completed(plan, verifier)
         if result is None and fresh.get("saved_result"):
             result = _verify_receipt(fresh["saved_result"], plan["check"], plan, verifier)
@@ -335,6 +336,9 @@ def run_parallel(plan, *, origin="parallel", check_runner=None, train_runner=Non
                     "format_version": FORMAT, "group": plan["group"], "origin": origin,
                     "checkpoint_sha256": result["checkpoint_sha256"], "run": result["run"], "adopted_at": _now()})
             return deepcopy(result)
+        active = scanner(plan["study"], plan["group"])
+        if active:
+            raise ValueError(f"This group already has an unguarded live training worker; keep it running: {active}")
         attempt = _job_directory(plan) / ("parallel_" + uuid.uuid4().hex[:12])
         attempt.mkdir(parents=True, exist_ok=False)
         config = deepcopy(plan["job"]["config"])
