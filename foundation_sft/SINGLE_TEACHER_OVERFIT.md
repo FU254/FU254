@@ -74,7 +74,7 @@ nvidia-smi --query-gpu=index,name,memory.free,utilization.gpu --format=csv
 
 ## 自动选择空闲卡并后台启动
 
-此段创建一个新的四组研究。它只挑选利用率不超过5%、空闲显存至少20000MiB的GPU，最多4张；有1至3张时自动排队，没有符合条件的卡则停止并打印查询结果。启动前检测本轮协调器和指向本轮目录的worker，避免重复启动；不会终止其他任务。若已有检查研究或中断研究，使用后文恢复段。
+此段创建一个新的四组研究。它只挑选利用率不超过5%、已用显存不超过500MiB且空闲显存至少20000MiB的GPU，最多4张；有1至3张时自动排队，没有符合条件的卡则停止并打印查询结果。启动前检测本轮协调器和指向本轮目录的worker，避免重复启动；不会终止其他任务。若已有检查研究或中断研究，使用后文恢复段。
 
 ```bash
 cd /home/cfu/EVA-X-main
@@ -82,7 +82,7 @@ unset LD_LIBRARY_PATH
 unset CUDA_VISIBLE_DEVICES
 mkdir -p /home/cfu/EVA-X-main/runs/single_teacher_overfit
 
-mapfile -t single_overfit_devices < <(nvidia-smi --query-gpu=index,memory.free,utilization.gpu --format=csv,noheader,nounits | awk -F, '$2>=20000 && $3<=5 {gsub(/[[:space:]]/,"",$1); print "cuda:" $1; if (++count==4) exit}')
+mapfile -t single_overfit_devices < <(nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits | awk -F, '$2<=500 && $3>=20000 && $4<=5 {gsub(/[[:space:]]/,"",$1); print "cuda:" $1; if (++count==4) exit}')
 
 if pgrep -u "$(id -u)" -af '[r]un_single_teacher_overfit[.]py|foundation_sft[.]single_teacher_overfit|[r]un_single_teacher_distillation[.]py.*runs/single_teacher_overfit|foundation_sft[.]distillation.*runs/single_teacher_overfit'; then
     echo "已有本轮协调器或worker，未重复启动。"
@@ -158,7 +158,7 @@ if len(studies) != 1:
 print(studies[0])
 PY
 )
-mapfile -t single_overfit_devices < <(nvidia-smi --query-gpu=index,memory.free,utilization.gpu --format=csv,noheader,nounits | awk -F, '$2>=20000 && $3<=5 {gsub(/[[:space:]]/,"",$1); print "cuda:" $1; if (++count==4) exit}')
+mapfile -t single_overfit_devices < <(nvidia-smi --query-gpu=index,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits | awk -F, '$2<=500 && $3>=20000 && $4<=5 {gsub(/[[:space:]]/,"",$1); print "cuda:" $1; if (++count==4) exit}')
 
 if pgrep -u "$(id -u)" -af '[r]un_single_teacher_overfit[.]py|foundation_sft[.]single_teacher_overfit|[r]un_single_teacher_distillation[.]py.*runs/single_teacher_overfit|foundation_sft[.]distillation.*runs/single_teacher_overfit'; then
     echo "已有本轮协调器或worker，未重复启动。"

@@ -27,7 +27,7 @@ PAYLOAD_SHA256 = {
     "foundation_sft/single_teacher_overfit.py": "eb36edb96181814de0eff3f3c91752c31fd342bedcd8f465460324046591d0be",
     "foundation_sft/single_teacher_overfit_report.py": "323f1547b39b53491a733d88547d9d6e4a43ee28aaee491e8110a55b0f05d0b8",
     "foundation_sft/configs/single_teacher_overfit.json": "6c7508c1021e7623d89ad07ae183caea59a4c5b3fa3bd92dfac0add638d02dcb",
-    "foundation_sft/SINGLE_TEACHER_OVERFIT.md": "5689054621a606305ef9494b25ef6f79df43197f776f1417baf97b6cf08d41f8",
+    "foundation_sft/SINGLE_TEACHER_OVERFIT.md": "cbbe6b1428fc49bc7b68d4215fc3d0b80d034042a980e4362907b6aff50f3a74",
     "run_single_teacher_overfit.py": "d90199071f65786e32cd06d286ce0738b45c282c1de7953e183212df62f2582d"
 }
 PREREQUISITES = (
