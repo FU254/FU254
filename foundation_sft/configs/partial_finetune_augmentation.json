@@ -1,0 +1,11 @@
+{
+  "study_type": "intensity_augmentation",
+  "source_study": "runs/partial_finetune_study/studies/study_20261027T150707Z_1ad30256",
+  "seeds": [42],
+  "brightness_jitter": 0.1,
+  "contrast_jitter": 0.1,
+  "devices": ["cuda:0"],
+  "max_parallel": 1,
+  "cache_dir": "runs/foundation_sft/data_cache",
+  "output_root": "runs/partial_finetune_augmentation"
+}

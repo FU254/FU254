@@ -3,6 +3,8 @@
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import math
+from numbers import Real
 from pathlib import Path
 import re
 
@@ -388,12 +390,35 @@ def _resize_image(pixels, preprocess):
     return np.clip(result, 0.0, 1.0)
 
 
+def _intensity_amplitude(value, name):
+    if (isinstance(value, bool) or not isinstance(value, Real)
+            or not math.isfinite(value) or not 0 <= value < 1):
+        raise ValueError(f"{name} must be finite numeric with 0 <= amplitude < 1.")
+    return float(value)
+
+
+def intensity_augmentation(brightness_jitter=0.0, contrast_jitter=0.0):
+    """Describe the optional shared display transform; disabled runs add no proof."""
+    brightness = _intensity_amplitude(brightness_jitter, "brightness_jitter")
+    contrast = _intensity_amplitude(contrast_jitter, "contrast_jitter")
+    if not brightness and not contrast:
+        return None
+    return {
+        "brightness_factor_range": [1.0 - brightness, 1.0 + brightness],
+        "contrast_factor_range": [1.0 - contrast, 1.0 + contrast],
+        "factor_sampling": "independent_uniform_per_sample_for_nonzero_amplitudes",
+        "order": ["contrast_about_grayscale_spatial_mean", "brightness", "clamp_0_1"],
+        "training_only": True,
+        "application": "once_after_cache_and_geometry_before_normalization_and_shared_views",
+    }
+
+
 class CXRDataset(Dataset):
     """Return images and identities from one frozen cohort, without eager arrays."""
 
     def __init__(self, cohort, preprocess, training=False, seed=42,
                  horizontal_flip_probability=0.0, horizontal_flip_p=None, rotation_degrees=0.0,
-                 cache_dir=None):
+                 cache_dir=None, brightness_jitter=0.0, contrast_jitter=0.0):
         required = {"sample_id", "patient_id", "path", "label"}
         if required.difference(cohort.columns):
             raise ValueError("Dataset cohort is missing required columns.")
@@ -413,6 +438,8 @@ class CXRDataset(Dataset):
         self.rotation_degrees = float(rotation_degrees)
         if not np.isfinite(self.rotation_degrees) or self.rotation_degrees < 0:
             raise ValueError("rotation_degrees must be finite and nonnegative.")
+        self.brightness_jitter = _intensity_amplitude(brightness_jitter, "brightness_jitter")
+        self.contrast_jitter = _intensity_amplitude(contrast_jitter, "contrast_jitter")
         self.mean = torch.as_tensor(_spec_value(preprocess, "mean"), dtype=torch.float32).view(-1, 1, 1)
         self.std = torch.as_tensor(_spec_value(preprocess, "std"), dtype=torch.float32).view(-1, 1, 1)
         if (self.mean.shape[0] != 3 or self.std.shape[0] != 3
@@ -459,6 +486,17 @@ class CXRDataset(Dataset):
         if self.training and self.horizontal_flip_probability > 0:
             if torch.rand(()) < self.horizontal_flip_probability:
                 image = image.flip(-1)
+        if self.training and (self.contrast_jitter > 0 or self.brightness_jitter > 0):
+            # One display-field transform feeds every teacher and the student.
+            # Leave the disabled path untouched, including its RNG consumption.
+            if self.contrast_jitter > 0:
+                contrast = 1.0 + (float(torch.rand(())) * 2.0 - 1.0) * self.contrast_jitter
+                mean = image[0].mean()
+                image = (image - mean) * contrast + mean
+            if self.brightness_jitter > 0:
+                brightness = 1.0 + (float(torch.rand(())) * 2.0 - 1.0) * self.brightness_jitter
+                image = image * brightness
+            image = image.clamp(0.0, 1.0)
         image = (image - self.mean) / self.std
         return {
             "image": image,

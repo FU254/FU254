@@ -19,7 +19,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from . import train as supervised
-from .data import CXRDataset
+from .data import CXRDataset, intensity_augmentation
 from .distillation_data import SharedViewDataset
 from .distillation_losses import SingleTeacherDistillationLoss
 from .metrics import (aggregate_patient_predictions, binary_metrics,
@@ -143,6 +143,8 @@ def _training_settings(teacher_config, config):
     settings = deepcopy(teacher_config["training"])
     settings.update({"backbone_lr": 5e-5, "projection_lr": 1e-4})
     settings.update(config.get("training", {}))
+    intensity_augmentation(**{key: settings[key] for key in ("brightness_jitter", "contrast_jitter")
+                             if key in settings})
     lora = _student_options(config)["mode"] == "lora"
     if lora:
         # The teacher's optimizer LR belongs to a different experiment. Keep
@@ -205,10 +207,14 @@ def _build_student(config):
 
 def _loader(split, name, teacher_spec, student_spec, config, generator=None, include_teacher=False):
     train = config["training"]
+    intensity_augmentation(**{key: train[key] for key in ("brightness_jitter", "contrast_jitter")
+                             if key in train})
+    jitter = {key: train[key] for key in ("brightness_jitter", "contrast_jitter")
+              if name == "train" and train.get(key, 0.0) > 0}
     base = CXRDataset(
         split.loc[split["split"] == name], teacher_spec, training=name == "train",
         seed=config["seed"], horizontal_flip_probability=train["horizontal_flip_probability"],
-        rotation_degrees=train["rotation_degrees"], cache_dir=config.get("cache_dir"))
+        rotation_degrees=train["rotation_degrees"], cache_dir=config.get("cache_dir"), **jitter)
     paired = SharedViewDataset(base, student_size=student_spec.image_size,
                                include_teacher=include_teacher,
                                student_mean=student_spec.mean, student_std=student_spec.std)

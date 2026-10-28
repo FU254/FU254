@@ -1,7 +1,8 @@
 """Validation-only partial-finetuning screening and comparable learning curves.
 
-The existing full-finetuning baseline and the one validation-selected candidate
-may expose test metrics. Unselected candidate receipts remain validation-only.
+The original study may expose the existing full-finetuning baseline and its
+validation-selected candidate test metrics. Intensity augmentation studies
+remain validation-only and expose only historical baseline test metrics.
 Importing this module does not load Torch, image data or plotting libraries.
 """
 from copy import deepcopy
@@ -18,6 +19,13 @@ SUCCESS = {"completed", "resumed", "reused"}
 ARMS = ("baseline", "last8", "last4", "last2")
 LABELS = {"baseline": "Full 12 blocks (existing P-E)",
           "last8": "Last 8 blocks", "last4": "Last 4 blocks", "last2": "Last 2 blocks"}
+AUGMENTATION_ARMS = ("baseline", "augmented")
+AUGMENTATION_LABELS = {"baseline": "Last8 existing",
+                       "augmented": "Last8 + shared intensity jitter"}
+AUGMENTATION_SELECTION_RULE = (
+    "Maximize best validation patient ROC-AUC; exact ties retain the existing baseline. "
+    "This validation-only study performs no new test evaluation or test-based winner selection or promotion."
+)
 SELECTION_RULE = (
     "Maximize best validation patient ROC-AUC after all three candidates complete; "
     "exact ties prefer fewer trainable student parameters. Test metrics are not used."
@@ -29,9 +37,25 @@ FIT_NOTE = (
 )
 
 
+def _augmentation(state):
+    return state.get("plan", {}).get("study_type") == "intensity_augmentation"
+
+
+def _arms(state):
+    return AUGMENTATION_ARMS if _augmentation(state) else ARMS
+
+
+def _labels(state):
+    return AUGMENTATION_LABELS if _augmentation(state) else LABELS
+
+
+def _validation_only(state):
+    return _augmentation(state) or state.get("plan", {}).get("evaluation_policy") == "validation_only"
+
+
 def _entries(state):
     return {"baseline": state.get("baseline", {}),
-            **{arm: state.get("candidates", {}).get(arm, {}) for arm in ARMS[1:]}}
+            **{arm: state.get("candidates", {}).get(arm, {}) for arm in _arms(state)[1:]}}
 
 
 def _count(entry, result):
@@ -62,38 +86,45 @@ def _completed(study, arm, entry):
     return result, run, history, best
 
 
-def _base_row(arm, entry):
+def _base_row(arm, entry, state):
     config = entry.get("job", {}).get("config", {})
-    return {"arm": arm, "student_update": LABELS[arm],
-        "train_last_blocks": 12 if arm == "baseline" else int(arm[4:]),
+    row = {"arm": arm, "student_update": _labels(state)[arm],
+        "train_last_blocks": 8 if _augmentation(state) else (12 if arm == "baseline" else int(arm[4:])),
         "seed": config.get("seed", 42), "backbone_lr": config.get("training", {}).get("backbone_lr"),
         "status": entry.get("status", "pending"), "trainable_student_parameters": None,
         "val_auc": None, "val_pr_auc": None, "best_epoch": None, "last_epoch": None,
         "run": None, "error": entry.get("error")}
+    if _augmentation(state):
+        training = config.get("training", {})
+        row.update(brightness_jitter=training.get("brightness_jitter", 0.0),
+                   contrast_jitter=training.get("contrast_jitter", 0.0))
+    return row
 
 
 def screening_rows(study, state):
     rows = []
     entries = _entries(state)
-    for arm in ARMS:
+    for arm in _arms(state):
         entry = entries[arm]
-        row = _base_row(arm, entry)
+        row = _base_row(arm, entry, state)
         if row["status"] in SUCCESS:
             result, run, history, best = _completed(study, arm, entry)
             row.update(run=str(run), trainable_student_parameters=_count(entry, result),
                 val_auc=best["val_patient_roc_auc"], val_pr_auc=best.get("val_patient_pr_auc"),
                 best_epoch=best["epoch"], last_epoch=history[-1]["epoch"])
+            if _augmentation(state) and row["trainable_student_parameters"] != 3_559_489:
+                raise ValueError("Intensity augmentation requires 3559489 trainable student parameters in both arms")
         rows.append(row)
     return rows
 
 
-def _test_row(arm, receipt, *, source, selected):
+def _test_row(arm, receipt, *, source, selected, labels=LABELS):
     if receipt.get("phase") != "main" or receipt.get("status") != "completed":
         raise ValueError("Test reporting requires a completed main evaluation receipt")
     patient = receipt.get("test_patient")
     if not isinstance(patient, dict):
         raise ValueError("A reported test evaluation needs saved patient metrics")
-    row = {"arm": arm, "student_update": LABELS[arm], "source": source,
+    row = {"arm": arm, "student_update": labels[arm], "source": source,
         "selected_by_validation": bool(selected), "roc_auc": None, "pr_auc": None,
         "ap": None, "sensitivity": None, "specificity": None,
         "roc_ci_lower": None, "roc_ci_upper": None, "run": receipt.get("run")}
@@ -117,14 +148,19 @@ def test_rows(study, state):
     entries = _entries(state)
     selection = state.get("selection", {})
     selected = selection.get("arm") if selection.get("status") == "selected" else None
-    if selected is not None and selected not in ARMS:
+    if selected is not None and selected not in _arms(state):
         raise ValueError("Unknown validation-selected partial-finetuning arm")
     output = []
     baseline = entries["baseline"]
     if baseline.get("status") in SUCCESS:
         result, _, _, _ = _completed(study, "baseline", baseline)
-        output.append(_test_row("baseline", result, source="historical baseline", selected=selected == "baseline"))
+        output.append(_test_row("baseline", result, source="historical baseline", selected=selected == "baseline",
+                                labels=_labels(state)))
     evaluation = state.get("selected_evaluation", {})
+    if _validation_only(state):
+        if evaluation.get("status") in SUCCESS or "result" in evaluation:
+            raise ValueError("A validation-only study must not contain a selected test evaluation")
+        return output
     if evaluation.get("status") not in SUCCESS:
         return output
     if selected is None:
@@ -174,7 +210,7 @@ def matched_epoch_rows(rows):
     base_history, _ = common._history(available["baseline"]["run"], available["baseline"]["val_auc"])
     baseline = {row["epoch"]: row for row in base_history}
     output = []
-    for arm in ARMS[1:]:
+    for arm in (row["arm"] for row in rows if row["arm"] != "baseline"):
         if arm not in available:
             continue
         history, _ = common._history(available[arm]["run"], available[arm]["val_auc"])
@@ -197,7 +233,8 @@ def build_report(study, state):
     rows = screening_rows(study, state)
     return {"rows": rows, "test_rows": test_rows(study, state),
         "overfitting": overfitting_rows(rows), "matched_epochs": matched_epoch_rows(rows),
-        "selection": deepcopy(state.get("selection", {})), "selection_rule": SELECTION_RULE,
+        "selection": deepcopy(state.get("selection", {})),
+        "selection_rule": AUGMENTATION_SELECTION_RULE if _augmentation(state) else SELECTION_RULE,
         "fit_note": FIT_NOTE, "single_seed": True}
 
 
@@ -208,15 +245,18 @@ def write_report(study, state):
                       ("overfitting", "overfitting"), ("matched_epochs", "matched_epochs")):
         records._csv(root / (name + ".csv"), report[key])
     records._json(root / "selection.json", {"selection": report["selection"],
-        "rule": SELECTION_RULE, "test_metrics_used": False})
+        "rule": report["selection_rule"], "test_metrics_used": False})
     return report
 
 
 def print_metrics(study, state):
     report = build_report(study, state)
-    print(f"\nPartial-finetuning study: {study}")
+    title = "Intensity augmentation study" if _augmentation(state) else "Partial-finetuning study"
+    print(f"\n{title}: {study}")
     print("Screening is validation only. Unselected candidate test metrics are not evaluated or reported.")
     columns = ("arm", "train_last_blocks", "status", "trainable_student_parameters", "val_auc", "val_pr_auc", "best_epoch", "last_epoch")
+    if _augmentation(state):
+        columns += ("brightness_jitter", "contrast_jitter")
     print("  ".join(columns))
     for row in report["rows"]:
         print("  ".join(records._number(row.get(key)) if key in ("val_auc", "val_pr_auc")
@@ -224,7 +264,10 @@ def print_metrics(study, state):
         if row.get("error"):
             print("  " + str(row["error"]))
     print("Frozen validation selection: " + json.dumps(report["selection"], ensure_ascii=False, sort_keys=True))
-    print("Saved patient test metrics: existing baseline and the validation-selected candidate only.")
+    if _validation_only(state):
+        print("Validation-only study: no new test evaluation. Saved patient test metrics below are historical baseline only.")
+    else:
+        print("Saved patient test metrics: existing baseline and the validation-selected candidate only.")
     columns = ("arm", "source", "roc_auc", "pr_auc", "ap", "sensitivity", "specificity", "roc_ci_lower", "roc_ci_upper")
     print("  ".join(columns))
     for row in report["test_rows"]:
@@ -233,7 +276,7 @@ def print_metrics(study, state):
         print(f"{row['arm']} best={row['best_epoch']} last={row['last_epoch']} "
             f"best_auc_gap={row['best_auc_gap']:.4f} last_auc_gap={row['last_auc_gap']:.4f} "
             f"best_loss_gap={row['best_loss_gap']:.6f} last_loss_gap={row['last_loss_gap']:.6f}")
-    print(SELECTION_RULE)
+    print(report["selection_rule"])
     print(FIT_NOTE)
     print("Single seed42: seed variability and seed SD are not estimable. PR-AUC and AP are distinct.")
     return report
@@ -252,17 +295,18 @@ def plot_curves(study, state):
     root.mkdir(parents=True, exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix="curves_", dir=root))
     paths = {"directory": str(output)}
+    arms, labels = _arms(state), _labels(state)
 
     def panels(name, painter, ylabel, bounds=None):
-        figure, axes = plt.subplots(1, 4, figsize=(18, 4), sharey=True)
+        figure, axes = plt.subplots(1, len(arms), figsize=(4.5 * len(arms), 4), sharey=True)
         try:
-            for axis, arm in zip(axes, ARMS):
-                axis.set(title=LABELS[arm], xlabel="Epoch", ylabel=ylabel)
+            for axis, arm in zip(axes, arms):
+                axis.set(title=labels[arm], xlabel="Epoch", ylabel=ylabel)
                 axis.grid(alpha=.25)
                 if bounds is not None:
                     axis.set_ylim(*bounds)
                 if arm not in histories:
-                    axis.text(.5, .5, "No completed history\n" + report["rows"][ARMS.index(arm)]["status"],
+                    axis.text(.5, .5, "No completed history\n" + report["rows"][arms.index(arm)]["status"],
                               ha="center", va="center", transform=axis.transAxes)
                     continue
                 history, best = histories[arm]
@@ -300,7 +344,7 @@ def plot_curves(study, state):
                 axis.plot(epochs, values, label=label)
         axis.text(.02, .02, "Optimization loss includes KD", fontsize=7, transform=axis.transAxes)
     panels("optimization_losses", optimization, "Training objective")
-    records._json(output / "plot_metadata.json", {"available_arms": [a for a in ARMS if a in histories],
-        "missing_arms": [a for a in ARMS if a not in histories], "loss_definition": FIT_NOTE,
+    records._json(output / "plot_metadata.json", {"available_arms": [a for a in arms if a in histories],
+        "missing_arms": [a for a in arms if a not in histories], "loss_definition": FIT_NOTE,
         "best_epoch": "First epoch attaining maximum validation patient ROC-AUC", "test_curves": False})
     return paths

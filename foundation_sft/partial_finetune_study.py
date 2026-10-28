@@ -1,4 +1,4 @@
-"""Three validation-only partial-finetuning candidates beside the fixed P-E baseline."""
+"""Reuse partial-student training for freeze-range or shared-intensity screening."""
 from __future__ import annotations
 
 import argparse
@@ -47,6 +47,9 @@ def make_plan(config_path, project, *, devices=None, max_parallel=None, cache_di
     project = Path(project).expanduser().resolve()
     path = records._path(config_path, project)
     settings = records._read(path)
+    if settings.get("study_type") == "intensity_augmentation":
+        return _augmentation_plan(settings, path, project, devices=devices, max_parallel=max_parallel,
+            cache_dir=cache_dir, source_study=source_study)
     allowed = {"source_study", "seeds", "train_last_blocks", "devices", "max_parallel", "cache_dir", "output_root"}
     if set(settings) - allowed:
         raise ValueError("Only the freeze range changes in this study; unsupported settings: " + str(sorted(set(settings)-allowed)))
@@ -108,14 +111,91 @@ def make_plan(config_path, project, *, devices=None, max_parallel=None, cache_di
         "baseline": baseline, "jobs": jobs, "new_optimization_trainings": 3}
 
 
+def _augmentation_plan(settings, path, project, *, devices, max_parallel, cache_dir, source_study):
+    """One new training; reuse the exact validation-selected last8 receipt."""
+    allowed = {"study_type", "source_study", "seeds", "brightness_jitter", "contrast_jitter",
+               "devices", "max_parallel", "cache_dir", "output_root"}
+    if set(settings) - allowed:
+        raise ValueError("Only shared intensity augmentation changes: " + str(sorted(set(settings)-allowed)))
+    if settings.get("seeds") != [42] or any(type(seed) is not int for seed in settings["seeds"]):
+        raise ValueError("The approved augmentation screening uses only seed42")
+    changes = {}
+    for key in ("brightness_jitter", "contrast_jitter"):
+        value = settings.get(key)
+        if type(value) not in (int, float) or value != .1:
+            raise ValueError("This one-candidate screening requires " + key + "=0.1")
+        changes[key] = value
+    source = records._path(source_study or settings["source_study"], project)
+    saved = records._read(source / "study.json")
+    if saved.get("format_version") != FORMAT or saved.get("plan", {}).get("study_type"):
+        raise ValueError("Source must be the completed 12/8/4/2 freeze-range study")
+    _same("source project", saved["plan"]["project"], str(project))
+    _same("source protocol", protocol_hash(saved["plan"]), saved.get("protocol_sha256"))
+    _same("source completion", saved.get("status"), "completed")
+    _same("source validation selection", select_setting(saved), saved.get("selection"))
+    _same("source selected freeze range", saved["selection"].get("arm"), "last8")
+    record = deepcopy(saved["candidates"]["last8"])
+    if record.get("status") not in SUCCESS:
+        raise ValueError("The exact last8 source must be complete")
+    expected = next(job for job in saved["plan"]["jobs"] if job["id"] == "last8")
+    _same("source last8 recipe", original._scientific_config(record["job"]["config"]),
+          original._scientific_config(expected["config"]))
+    check = _checked(record["check"], record["job"])
+    config = deepcopy(record["job"]["config"])
+    for key, value in (("student_initialization", "imagenet"), ("method", "equal"), ("seed", 42), ("phase", "pilot")):
+        _same("source " + key, config.get(key), value)
+    _same("source student", config.get("student"), {"mode": "partial_finetune", "train_last_blocks": 8})
+    _same("source three KD settings", config.get("distillation"), original.LOSS_SETTINGS)
+    for key in changes:
+        _same("source disabled " + key, config["training"].get(key, 0.), 0.)
+    evaluation = saved.get("selected_evaluation", {})
+    result = deepcopy(evaluation.get("result"))
+    if evaluation.get("status") not in SUCCESS or not isinstance(result, dict):
+        raise ValueError("Source last8 needs its existing completed evaluation receipt")
+    _same("source evaluation arm", evaluation.get("arm"), "last8")
+    for key, value in (("phase", "main"), ("status", "completed"),
+                       ("checkpoint_sha256", record["result"]["checkpoint_sha256"]),
+                       ("run", record["result"]["run"]),
+                       ("best_val_patient_roc_auc", record["result"]["best_val_patient_roc_auc"])):
+        _same("source evaluation " + key, result.get(key), value)
+    checksum = result["checkpoint_sha256"]
+    if not isinstance(checksum, str) or len(checksum) != 64:
+        raise ValueError("Source last8 requires its checkpoint fingerprint")
+    chosen, maximum, cache = _runtime(settings, project, devices, max_parallel, cache_dir)
+    cache = cache or config.get("cache_dir")
+    output = records._path(settings.get("output_root", "runs/partial_finetune_augmentation"), project)
+    if output == source or output.is_relative_to(source):
+        raise ValueError("The new study cannot write inside the source study")
+    config.update(phase="main", selected_checkpoint_sha256=checksum,
+        device=chosen[0], cache_dir=cache, output_root=str(output / "unmaterialized"))
+    check["config"].update(phase="main", selected_checkpoint_sha256=checksum)
+    baseline = {"job": _job(config, "baseline"), "check": check,
+        "result": result, "source_study": str(source)}
+    candidate = deepcopy(config)
+    candidate.pop("selected_checkpoint_sha256")
+    candidate["phase"] = "pilot"
+    candidate["training"].update(changes)
+    rule = {"metric": "best validation patient ROC-AUC", "ties": "retain the existing last8 baseline",
+            "test_metrics_used": False, "requires_all_candidates": True, "intensity_augmentation": changes}
+    return {"format_version": FORMAT, "study_type": "intensity_augmentation", "project": str(project),
+        "config_path": str(path), "source_study": str(source), "source_protocol_sha256": saved["protocol_sha256"],
+        "output_root": str(output), "devices": chosen, "max_parallel": maximum, "cache_dir": cache,
+        "seeds": [42], "selection_rule": rule, "baseline": baseline, "jobs": [_job(candidate, "augmented")],
+        "training_changes": changes, "evaluation_policy": "validation_only", "new_optimization_trainings": 1}
+
+
 def protocol_hash(plan):
-    return records._hash({"format_version": FORMAT, "project": plan["project"],
+    value = {"format_version": FORMAT, "project": plan["project"],
         "source_study": plan["source_study"], "source_protocol_sha256": plan["source_protocol_sha256"],
         "baseline": {"run": plan["baseline"]["result"]["run"],
             "checkpoint_sha256": plan["baseline"]["result"]["checkpoint_sha256"],
             "config": original._scientific_config(plan["baseline"]["job"]["config"])},
         "selection_rule": plan["selection_rule"], "jobs": [{"id": job["id"],
-            "config": original._scientific_config(job["config"])} for job in plan["jobs"]]})
+            "config": original._scientific_config(job["config"])} for job in plan["jobs"]]}
+    # Preserve historical freeze-range fingerprints exactly.
+    if "study_type" in plan:
+        value.update({key: plan[key] for key in ("study_type", "training_changes", "evaluation_policy")})
+    return records._hash(value)
 
 
 def _checked(value, job):
@@ -132,12 +212,18 @@ def _checked(value, job):
     return check
 
 
-def _audit(check, baseline):
+def _audit(check, baseline, training_changes=None):
     for key in ("initial_state_sha256", "head_initial_state_sha256", "distillation_initial_state_sha256",
                 "head_initialization", "teacher", "teachers", "shared_view", "teacher_views", "cohort_hash", "weighting_metadata"):
         _same("same initialized tensors and sources: " + key, check.get(key), baseline.get(key))
-    for key in ("training", "evaluation", "distillation", "student_initialization", "seed", "method"):
+    for key in ("evaluation", "distillation", "student_initialization", "seed", "method"):
         _same("same effective " + key, check["config"].get(key), baseline["config"].get(key))
+    training = deepcopy(baseline["config"].get("training"))
+    if training_changes:
+        training.update(training_changes)
+        for key in ("model_metadata", "frozen_parameter_sha256", "student_frozen_parameter_names", "student_trainable_parameter_names"):
+            _same("unchanged partial student " + key, check.get(key), baseline.get(key))
+    _same("same effective training", check["config"].get("training"), training)
     left, right = deepcopy(check["model_metadata"]), deepcopy(baseline["model_metadata"])
     for value in (left, right):
         for key in ("mode", "trainable_parameters", "partial_finetune"):
@@ -185,7 +271,9 @@ def _verify(run, check, job):
 
 def select_setting(state):
     entries = {"baseline": state["baseline"], **state["candidates"]}
-    if set(entries) != {"baseline", "last8", "last4", "last2"} or any(r.get("status") not in SUCCESS for r in entries.values()):
+    expected = ({"baseline", "augmented"} if state.get("plan", {}).get("study_type") == "intensity_augmentation"
+                else {"baseline", "last8", "last4", "last2"})
+    if set(entries) != expected or any(r.get("status") not in SUCCESS for r in entries.values()):
         return {"status": "incomplete", "test_metrics_used": False}
     choices = []
     for arm, record in entries.items():
@@ -284,7 +372,9 @@ def run_study(plan, *, resume_study=None, check_only=False, launcher=None, verif
             return value
         persist()
         print(f"Study directory: {study}", flush=True)
-        print("Reuse exact P-E; three validation-only candidates (last8,last4,last2); evaluate at most one selected new model.", flush=True)
+        augmentation = plan.get("study_type") == "intensity_augmentation"
+        print("Reuse exact last8; one shared-intensity candidate; validation only, no new test evaluation." if augmentation else
+              "Reuse exact P-E; three validation-only candidates (last8,last4,last2); evaluate at most one selected new model.", flush=True)
         previous = {job["id"]: deepcopy(entry(job).get("result")) for job in plan["jobs"]}
         try:
             jobs = [plan["baseline"]["job"], *plan["jobs"]]
@@ -314,8 +404,8 @@ def run_study(plan, *, resume_study=None, check_only=False, launcher=None, verif
                 if record["status"] != "checked":
                     continue
                 try:
-                    _audit(record["check"], base["check"])
-                    if record["check"]["model_metadata"]["trainable_parameters"] >= base["check"]["model_metadata"]["trainable_parameters"]:
+                    _audit(record["check"], base["check"], plan.get("training_changes"))
+                    if not augmentation and record["check"]["model_metadata"]["trainable_parameters"] >= base["check"]["model_metadata"]["trainable_parameters"]:
                         raise ValueError("A partial candidate must train fewer student parameters than baseline")
                     if previous[job["id"]]:
                         receipt = verify(previous[job["id"]]["run"], record["check"], job)
@@ -350,7 +440,12 @@ def run_study(plan, *, resume_study=None, check_only=False, launcher=None, verif
                 _same("frozen validation selection", selected, state["selection"])
             state["selection"] = selected
             persist()
-            if selected.get("status") == "selected" and not check_only:
+            validation_only = plan.get("evaluation_policy") == "validation_only"
+            if selected.get("status") == "selected" and not check_only and validation_only:
+                state["selected_evaluation"] = {"status": "not_requested", "arm": selected["arm"],
+                    "reason": "This augmentation screening uses train/validation only; no new test evaluation."}
+                persist()
+            if selected.get("status") == "selected" and not check_only and not validation_only:
                 evaluation = state["selected_evaluation"]
                 if selected["arm"] == "baseline":
                     evaluation.update(status="reused", arm="baseline", result=deepcopy(base["result"]))
@@ -377,7 +472,8 @@ def run_study(plan, *, resume_study=None, check_only=False, launcher=None, verif
                     except Exception as error:
                         evaluation.update(status="failed", error=str(error))
                 persist()
-            if selected.get("status") == "selected" and state["selected_evaluation"].get("status") in SUCCESS:
+            if selected.get("status") == "selected" and (state["selected_evaluation"].get("status") in SUCCESS or
+                    (validation_only and state["selected_evaluation"].get("status") == "not_requested")):
                 state["status"] = "completed"
             elif check_only and all(entry(j)["status"] in SUCCESS | {"checked"} for j in jobs):
                 state["status"] = "checked"

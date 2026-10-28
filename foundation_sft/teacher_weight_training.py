@@ -27,6 +27,7 @@ from . import distillation_suite as records
 from . import equal_teacher_distillation as equal
 from . import random_student_distillation as random_student
 from . import train as supervised
+from .data import intensity_augmentation
 from .equal_teacher_sources import load_teacher, validate_teacher_cohorts
 from .equal_teacher_losses import TEACHER_NAMES
 from .metrics import aggregate_patient_predictions, binary_metrics, save_evaluation, select_threshold
@@ -60,6 +61,8 @@ def _validate_config(config):
         raise ValueError("Partial fine-tuning requires the ImageNet-initialized student")
     records._same("fixed three-term KD", config.get("distillation"), LOSS_SETTINGS)
     train = config.get("training", {})
+    intensity_augmentation(**{key: train[key] for key in ("brightness_jitter", "contrast_jitter")
+                             if key in train})
     for key, expected in (("weight_decay", .01), ("drop_path_rate", 0.)):
         value = train.get(key, 0. if key == "drop_path_rate" else None)
         if type(value) not in (int, float) or not math.isfinite(value) or value != expected:
@@ -153,6 +156,10 @@ def _initial_proof(student, kd, config):
         "head_initial_state_sha256": single._state_hash(student.encoder.head.state_dict()),
         "distillation_initial_state_sha256": _projector_hash(kd),
         "head_initialization": _head_protocol(config["seed"])}
+    augmentation = intensity_augmentation(**{key: config["training"][key]
+        for key in ("brightness_jitter", "contrast_jitter") if key in config["training"]})
+    if augmentation is not None:
+        proof["intensity_augmentation"] = augmentation
     if single._student_options(config)["mode"] == "partial_finetune":
         frozen = {name: value for name, value in student.named_parameters() if not value.requires_grad}
         trainable = [name for name, value in student.named_parameters() if value.requires_grad]
@@ -595,6 +602,9 @@ def _read_run(run, *, checkpoint_loader=None):
     config = records._read(run / "config.json")
     _validate_config(config)
     _partial_checkpoint_proof(payload)
+    expected_augmentation = intensity_augmentation(**{key: config["training"][key]
+        for key in ("brightness_jitter", "contrast_jitter") if key in config["training"]})
+    records._same("checkpoint intensity augmentation", payload.get("intensity_augmentation"), expected_augmentation)
     records._same("worker experiment", payload.get("experiment"), EXPERIMENT)
     _protocol(payload["config"], config)
     files = _data_files(run)
@@ -698,6 +708,9 @@ def verify_completed_run(run, check, job, *, checkpoint_loader=None):
     for key in ("initial_state_sha256", "head_initial_state_sha256", "distillation_initial_state_sha256", "head_initialization"):
         records._same("preflight " + key, check.get(key), payload.get(key))
         records._same("result " + key, result.get(key), payload.get(key))
+    for name, value in (("preflight", check), ("result", result)):
+        records._same(name + " intensity augmentation", value.get("intensity_augmentation"),
+                      payload.get("intensity_augmentation"))
     if single._student_options(saved)["mode"] == "partial_finetune":
         records._same("partial result student mode", result.get("student_mode"), "partial_finetune")
         for key in ("frozen_parameter_sha256", "student_frozen_parameter_names", "student_trainable_parameter_names"):
