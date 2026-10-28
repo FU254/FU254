@@ -1,0 +1,9 @@
+{
+  "source_suite": "runs/single_teacher_distillation/suites/suite_20261019T110343Z_3b1acd96",
+  "output_root": "runs/single_teacher_overfit",
+  "seed": 42,
+  "devices": ["cuda:0"],
+  "max_parallel": 1,
+  "cache_dir": "runs/foundation_sft/data_cache",
+  "l2_sp_coefficient": 0.0001
+}

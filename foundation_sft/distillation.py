@@ -12,6 +12,7 @@ import json
 import math
 from pathlib import Path
 import re
+import time
 import uuid
 
 import torch
@@ -205,6 +206,11 @@ def _build_student(config):
     return build_vit_tiny_student(config["student_checkpoint"], **options)
 
 
+def _validate_diagnostics(config, condition=None):
+    from .single_teacher_diagnostics import validate_options
+    return validate_options(config, student_mode=_student_options(config)["mode"], condition=condition)
+
+
 def _loader(split, name, teacher_spec, student_spec, config, generator=None, include_teacher=False):
     train = config["training"]
     intensity_augmentation(**{key: train[key] for key in ("brightness_jitter", "contrast_jitter")
@@ -266,7 +272,8 @@ def _batch_loss(student, teacher, kd, batch, hard_loss, device):
     return values
 
 
-def _train_epoch(student, teacher, kd, loader, optimizer, hard_loss, device, train):
+def _train_epoch(student, teacher, kd, loader, optimizer, hard_loss, device, train,
+                 *, regularizer=None, progress=None):
     student.train()
     teacher.eval()
     if kd is not None:
@@ -274,9 +281,17 @@ def _train_epoch(student, teacher, kd, loader, optimizer, hard_loss, device, tra
     parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
     optimizer.zero_grad(set_to_none=True)
     totals = {name: 0.0 for name in ("total", "hard", "kd", "soft", "global", "local")}
+    if regularizer is not None:
+        totals.update(l2_sp=0.0, l2_sp_penalty=0.0)
     total_images, window_images, denominator, steps = 0, 0, None, 0
+    progress_time = time.monotonic() if progress is not None else None
     for index, batch in enumerate(loader):
         values = _batch_loss(student, teacher, kd, batch, hard_loss, device)
+        if regularizer is not None:
+            raw, penalty = regularizer.losses(student)
+            values.update(l2_sp=raw, l2_sp_penalty=penalty, total=values["total"] + penalty)
+            if not torch.isfinite(values["total"]).item():
+                raise RuntimeError("Non-finite L2-SP penalty; no update was applied")
         count = len(batch["label"])
         if not window_images:
             denominator = count * train["accumulation_steps"]
@@ -296,6 +311,12 @@ def _train_epoch(student, teacher, kd, loader, optimizer, hard_loss, device, tra
             optimizer.zero_grad(set_to_none=True)
             window_images = 0
             steps += 1
+        if progress is not None and (index == 0 or index + 1 == len(loader)
+                                     or time.monotonic() - progress_time >= 30):
+            print(json.dumps({**progress, "phase": "training", "batch": index + 1,
+                              "batches": len(loader), "optimizer_steps": steps,
+                              "running_train_loss": totals["total"] / total_images}), flush=True)
+            progress_time = time.monotonic()
     if not steps:
         raise ValueError("Empty training loader; no optimizer update completed")
     if any(parameter.grad is not None or parameter.requires_grad for parameter in teacher.parameters()):
@@ -303,12 +324,20 @@ def _train_epoch(student, teacher, kd, loader, optimizer, hard_loss, device, tra
     return {**{key: value / total_images for key, value in totals.items()}, "optimizer_steps": steps}
 
 
-def _student_payload(student, config, cohort_hash, condition, initial_hash, teacher_info, geometry):
+def _student_payload(student, config, cohort_hash, condition, initial_hash, teacher_info, geometry,
+                     *, diagnostics_proof=None):
     payload = {"format_version": FORMAT, "model": student.trainable_state_dict(),
             "model_metadata": student.training_metadata(), "config": deepcopy(config),
             "cohort_hash": cohort_hash, "condition": condition,
             "initial_state_sha256": initial_hash, "teacher": teacher_info,
             "shared_view": geometry}
+    if "diagnostics" in config:
+        payload.update(diagnostics=deepcopy(diagnostics_proof or _validate_diagnostics(config, condition)),
+                       evaluation_phase="validation_only", test_evaluated=False)
+        if diagnostics_proof is not None:
+            payload.update({key: diagnostics_proof[key] for key in (
+                "initial_backbone_state_sha256", "initial_head_state_sha256", "distillation_initial_state_sha256")
+                if key in diagnostics_proof})
     if "regularization" in payload["model_metadata"]:
         state = student.stochastic_state_dict()
         if state is None:
@@ -388,7 +417,70 @@ def inference_dataset(cohort, payload, cache_dir=None):
     return dataset
 
 
+def _clean_loader_metadata(loader, name, geometry, *, private_generator):
+    dataset = loader.dataset
+    base = dataset.base
+    configured_augmentation = {key: getattr(base, key) for key in (
+        "horizontal_flip_probability", "rotation_degrees", "brightness_jitter", "contrast_jitter")}
+    # The existing validation loader retains training transform amplitudes in
+    # its attributes; CXRDataset gates every random transform on training=False.
+    augmentation = {key: value if base.training else 0.0 for key, value in configured_augmentation.items()}
+    if (base.training or (private_generator and any(configured_augmentation.values())) or dataset.include_teacher
+            or dataset.metadata() != geometry or loader.drop_last
+            or type(loader.sampler).__name__ != "SequentialSampler"
+            or set(base.cohort["split"]) != {name}
+            or (private_generator and loader.generator is None)):
+        raise ValueError(f"The clean {name} diagnostic loader has changed its evaluation protocol")
+    return {"split": name, "training": False, "augmentation": augmentation,
+            "configured_augmentation": configured_augmentation,
+            "shuffle": False, "drop_last": False, "include_teacher": False,
+            "private_generator": private_generator, "num_workers": loader.num_workers,
+            "images": len(dataset), "patients": int(base.cohort.patient_id.nunique()),
+            "shared_view": deepcopy(geometry)}
+
+
+def _clean_train_loader(split, geometry, config):
+    payload = {"format_version": FORMAT, "shared_view": geometry}
+    loader = DataLoader(
+        inference_dataset(split.loc[split["split"] == "train"], payload, config.get("cache_dir")),
+        batch_size=config["training"]["batch_size"], shuffle=False,
+        num_workers=config["training"]["num_workers"], drop_last=False,
+        pin_memory=str(config["device"]).startswith("cuda"), worker_init_fn=supervised._seed_worker,
+        generator=torch.Generator().manual_seed((config["seed"] + 104729) % (2**32)))
+    _clean_loader_metadata(loader, "train", geometry, private_generator=True)
+    return loader
+
+
+def _diagnostic_predict(student, loader, device, hard_loss, training_generator):
+    # Include Python, NumPy, CPU/CUDA Torch and the training sampler stream.
+    # Worker seeds come from the loader's private stream, never the train one.
+    state = supervised._rng_state(training_generator)
+    try:
+        return supervised.predict(student, loader, device, criterion=hard_loss)
+    finally:
+        supervised._restore_rng(state, training_generator)
+
+
+def _diagnostic_gap(record):
+    train_auc, val_auc = record["train_eval_patient_roc_auc"], record["val_patient_roc_auc"]
+    return {"auc_gap": None if train_auc is None else train_auc - val_auc,
+            "loss_gap": record["val_loss"] - record["train_eval_loss"],
+            "auc_gap_definition": "clean train patient ROC-AUC minus validation patient ROC-AUC",
+            "loss_gap_definition": "validation Focal loss minus clean train Focal loss"}
+
+
+def _diagnostic_initialization(student, kd):
+    parameters = dict(student.named_parameters())
+    backbone = {name: value for name, value in parameters.items()
+                if name.startswith("encoder.") and not name.startswith("encoder.head.")}
+    head = {name: value for name, value in parameters.items() if name.startswith("encoder.head.")}
+    return {"initial_backbone_state_sha256": _state_hash(backbone),
+            "initial_head_state_sha256": _state_hash(head),
+            "distillation_initial_state_sha256": _state_hash(kd.state_dict()) if kd is not None else None}
+
+
 def _run_condition(condition, suite, teacher, split, config, teacher_info, expected_initial=None):
+    diagnostics = _validate_diagnostics(config, condition)
     run = suite / condition
     run.mkdir()
     device, train = supervised._device(config), config["training"]
@@ -397,10 +489,15 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
     initial_hash = _state_hash(student.state_dict())
     if expected_initial is not None and initial_hash != expected_initial:
         raise ValueError("Supervised and distilled students must start from exactly the same state")
+    regularizer = None
+    if diagnostics is not None and "l2_sp" in diagnostics:
+        from .single_teacher_diagnostics import ImageNetL2SP
+        regularizer = ImageNetL2SP(student, diagnostics["l2_sp"])
     kd = (SingleTeacherDistillationLoss(student_dim=student.feature_dim,
                                       teacher_dim=teacher.adapter.feature_dim,
                                       **config["distillation"]).to(device)
           if condition == "distillation" else None)
+    initial_parts = _diagnostic_initialization(student, kd) if diagnostics is not None else None
     teacher.to(device if kd is not None else "cpu").eval()
     teacher_before = _state_hash(teacher.state_dict())
     optimizer = _optimizer(student, kd, train)
@@ -414,6 +511,17 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
                            generator, include_teacher=kd is not None)
     val_loader = _loader(split, "val", teacher.adapter.preprocess, student.preprocess, config)
     geometry = train_loader.dataset.metadata()
+    diagnostic_proof, train_eval_loader = None, None
+    if diagnostics is not None:
+        train_eval_loader = _clean_train_loader(split, geometry, config)
+        diagnostic_proof = {"protocol": diagnostics["protocol"], "evaluation": diagnostics["evaluation"],
+            **initial_parts,
+            "clean_train_eval": _clean_loader_metadata(train_eval_loader, "train", geometry, private_generator=True),
+            "clean_validation": _clean_loader_metadata(val_loader, "val", geometry, private_generator=False),
+            "training_rng_preserved": True, "loss": "Focal hard-label loss only",
+            "checkpoint_selection": "first maximum validation patient ROC-AUC"}
+        if regularizer is not None:
+            diagnostic_proof["l2_sp"] = regularizer.metadata()
     cohort_hash = supervised._split_hash(split)
     supervised._json(run / "config.json", config)
     supervised._json(run / "model_metadata.json", student.training_metadata())
@@ -427,9 +535,16 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
         "precision": "FP32", "cohort_hash": cohort_hash})
     print(f"[{condition}] Run directory: {run}", flush=True)
     history, best_auc, bad_epochs = [], -math.inf, 0
+    best_epoch = None
     best_model = best_distillation = None
     for epoch in range(train["epochs"]):
-        losses = _train_epoch(student, teacher, kd, train_loader, optimizer, hard_loss, device, train)
+        if diagnostics is None:
+            losses = _train_epoch(student, teacher, kd, train_loader, optimizer, hard_loss, device, train)
+        else:
+            epoch_start = time.monotonic()
+            losses = _train_epoch(student, teacher, kd, train_loader, optimizer, hard_loss, device, train,
+                                  regularizer=regularizer, progress={"condition": condition, "epoch": epoch + 1})
+            print(f"[{condition}] epoch {epoch + 1}: validation", flush=True)
         validation, val_loss = supervised.predict(student, val_loader, device, criterion=hard_loss)
         patients = aggregate_patient_predictions(validation)
         metrics = binary_metrics(patients.label, patients.probability)
@@ -438,6 +553,7 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
             raise ValueError("Validation requires both classes for checkpoint selection")
         if val_auc > best_auc:
             best_auc, bad_epochs = val_auc, 0
+            best_epoch = epoch + 1
             best_model = student.trainable_state_dict()
             best_distillation = _cpu_state(kd) if kd is not None else None
         else:
@@ -449,14 +565,33 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
                         "val_loss": val_loss, "val_patient_roc_auc": val_auc,
                         "val_patient_pr_auc": metrics["pr_auc"],
                         "learning_rates": [group["lr"] for group in optimizer.param_groups]})
+        if diagnostics is not None:
+            print(f"[{condition}] epoch {epoch + 1}: clean train evaluation", flush=True)
+            train_eval, train_eval_loss = _diagnostic_predict(
+                student, train_eval_loader, device, hard_loss, generator)
+            train_patients = aggregate_patient_predictions(train_eval)
+            train_metrics = binary_metrics(train_patients.label, train_patients.probability)
+            history[-1].update(train_eval_loss=train_eval_loss,
+                train_eval_patient_roc_auc=train_metrics["roc_auc"],
+                train_eval_patient_pr_auc=train_metrics["pr_auc"],
+                train_eval_patient_average_precision=train_metrics["average_precision"],
+                epoch_seconds=time.monotonic() - epoch_start)
+            if regularizer is not None:
+                history[-1].update(train_l2_sp_loss=losses["l2_sp"], train_l2_sp_penalty=losses["l2_sp_penalty"])
+                diagnostic_proof["l2_sp"] = regularizer.metadata()
         print(json.dumps({"condition": condition, **history[-1]}), flush=True)
         scheduler.step()
-        payload = _student_payload(student, config, cohort_hash, condition, initial_hash, teacher_info, geometry)
+        payload = _student_payload(student, config, cohort_hash, condition, initial_hash, teacher_info, geometry,
+                                   diagnostics_proof=diagnostic_proof)
         payload.update(epoch=epoch, best_auc=best_auc, bad_epochs=bad_epochs,
                        best_model=best_model, best_distillation_state=best_distillation,
                        distillation_state=_cpu_state(kd) if kd is not None else None,
                        optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(),
                        rng=supervised._rng_state(generator), history=history)
+        if diagnostics is not None:
+            payload.update(best_epoch=best_epoch, last_epoch=epoch + 1,
+                           best_gap=_diagnostic_gap(history[best_epoch - 1]),
+                           last_gap=_diagnostic_gap(history[-1]))
         supervised._torch_save(run / "last.pt", payload)
         supervised._json(run / "history.json", history)
         if bad_epochs >= train["patience"]:
@@ -469,20 +604,72 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
     validation = supervised.predict(student, val_loader, device)
     patients = aggregate_patient_predictions(validation)
     threshold = select_threshold(patients.label, patients.probability)
-    payload = _student_payload(student, config, cohort_hash, condition, initial_hash, teacher_info, geometry)
+    payload = _student_payload(student, config, cohort_hash, condition, initial_hash, teacher_info, geometry,
+                               diagnostics_proof=diagnostic_proof)
     payload.update(threshold=threshold, best_val_patient_roc_auc=best_auc,
                    distillation_state=best_distillation)
+    if diagnostics is not None:
+        payload.update(best_epoch=best_epoch, last_epoch=history[-1]["epoch"],
+                       best_gap=_diagnostic_gap(history[best_epoch - 1]),
+                       last_gap=_diagnostic_gap(history[-1]))
     supervised._torch_save(run / "best.pt", payload)
     # Verify and use the saved complete student, rather than a stale in-memory snapshot.
     restored, restored_payload = load_student_checkpoint(run / "best.pt", device)
     del student
     student = restored
+    if diagnostics is not None:
+        # Verify both splits against the complete serialized selected student.
+        # Losses use only hard-label Focal, excluding KD and the optional anchor.
+        print(f"[{condition}] selected epoch {best_epoch}: clean train and validation evaluation", flush=True)
+        validation, selected_val_loss = _diagnostic_predict(student, val_loader, device, hard_loss, generator)
+        train_eval, selected_train_loss = _diagnostic_predict(
+            student, train_eval_loader, device, hard_loss, generator)
     validation.to_csv(run / "validation_predictions.csv", index=False)
     supervised._json(run / "selection.json", {
         "threshold": threshold, "source": "validation patient predictions",
         "best_val_patient_roc_auc": best_auc})
     if teacher_before != _state_hash(teacher.state_dict()):
         raise RuntimeError("Frozen teacher changed during student training")
+    if diagnostics is not None:
+        result = save_evaluation(validation, run / "validation", threshold=restored_payload["threshold"],
+            bootstrap_samples=config["evaluation"]["bootstrap_samples"], seed=config["seed"])
+        train_result = save_evaluation(train_eval, run / "train_eval", threshold=restored_payload["threshold"],
+            bootstrap_samples=config["evaluation"]["bootstrap_samples"], seed=config["seed"])
+        receipt = {"condition": condition, "status": "completed", "run": str(run),
+            "student_mode": _student_options(config)["mode"],
+            "student_trainable_parameters": sum(p.numel() for p in student.parameters() if p.requires_grad),
+            "distillation_trainable_parameters": sum(p.numel() for p in kd.parameters() if p.requires_grad) if kd is not None else 0,
+            "seed": config["seed"], "initial_state_sha256": initial_hash,
+            "cohort_hash": cohort_hash, "best_val_patient_roc_auc": best_auc, "threshold": threshold,
+            "evaluation_phase": "validation_only", "test_evaluated": False,
+            "validation_patient": result["patient"], "validation_image": result["image"],
+            "best_train_patient": train_result["patient"], "best_train_image": train_result["image"],
+            "best_train_eval_loss": selected_train_loss, "best_val_loss": selected_val_loss,
+            "roc_auc_ci": result["bootstrap"]["patient"].get("roc_auc"),
+            "best_epoch": best_epoch, "last_epoch": history[-1]["epoch"],
+            "best_gap": _diagnostic_gap(history[best_epoch - 1]), "last_gap": _diagnostic_gap(history[-1]),
+            "diagnostics": diagnostic_proof, "teacher_unchanged": True}
+        receipt.update(initial_parts)
+        if regularizer is not None:
+            receipt["diagnostics"]["l2_sp"] = regularizer.metadata()
+            raw, penalty = regularizer.losses(student)
+            receipt.update(best_l2_sp_loss=raw.detach().item(), best_l2_sp_penalty=penalty.detach().item())
+        receipt["artifacts"] = {
+            name: str(run / filename) for name, filename in (
+                ("best_checkpoint", "best.pt"), ("last_checkpoint", "last.pt"),
+                ("history", "history.json"), ("configuration", "config.json"),
+                ("selection", "selection.json"), ("shared_view", "shared_view.json"),
+                ("validation_predictions", "validation_predictions.csv"))}
+        for name in ("train_eval", "validation"):
+            receipt["artifacts"][name] = {filename: str(run / name / filename) for filename in (
+                "predictions.csv", "patient_predictions.csv", "metrics.json", "roc_curve.png",
+                "precision_recall_curve.png", "calibration_curve.png")}
+        restored_payload.update(best_train_eval_loss=selected_train_loss, best_val_loss=selected_val_loss,
+                                diagnostics=deepcopy(receipt["diagnostics"]))
+        supervised._torch_save(run / "best.pt", restored_payload)
+        supervised._json(run / "result.json", receipt)
+        print(f"[{condition}] completed (validation only)", flush=True)
+        return receipt
     test_loader = DataLoader(
         inference_dataset(split.loc[split["split"] == "test"], restored_payload, config.get("cache_dir")),
         batch_size=train["batch_size"], shuffle=False, num_workers=train["num_workers"],
@@ -507,6 +694,7 @@ def _run_condition(condition, suite, teacher, split, config, teacher_info, expec
 def _resolved(config, project):
     config = deepcopy(config)
     _student_options(config)
+    _validate_diagnostics(config)
     if type(config.get("seed", 42)) is not int or not 0 <= config.get("seed", 42) < 2**32:
         raise ValueError("seed must be an integer in [0, 2**32)")
     config.setdefault("seed", 42)
@@ -554,6 +742,8 @@ def run_experiments(config, project, conditions=None):
     conditions = tuple(CONDITIONS if conditions is None else conditions)
     if not conditions or len(set(conditions)) != len(conditions) or any(c not in CONDITIONS for c in conditions):
         raise ValueError("Select supervised and/or distillation once each")
+    for condition in conditions:
+        _validate_diagnostics(config, condition)
     config, teacher, split, info = _prepare(config, project)
     suite = _new_suite(config)
     supervised._json(suite / "config.json", config)
@@ -586,6 +776,7 @@ def run_experiments(config, project, conditions=None):
 def check(config, project, condition="distillation"):
     if condition not in CONDITIONS:
         raise ValueError("Unknown training condition")
+    diagnostics = _validate_diagnostics(config, condition)
     config, teacher, split, info = _prepare(config, project)
     device = supervised._device(config)
     supervised.set_seed(config["seed"])
@@ -597,11 +788,27 @@ def check(config, project, condition="distillation"):
                                       teacher_dim=teacher.adapter.feature_dim,
                                       **config["distillation"]).to(device)
           if condition == "distillation" else None)
+    diagnostic_proof, regularizer = None, None
+    if diagnostics is not None:
+        diagnostic_proof = {"protocol": diagnostics["protocol"], "evaluation": diagnostics["evaluation"],
+                            **_diagnostic_initialization(student, kd),
+                            "training_rng_preserved": True, "loss": "Focal hard-label loss only"}
+        if "l2_sp" in diagnostics:
+            from .single_teacher_diagnostics import ImageNetL2SP
+            regularizer = ImageNetL2SP(student, diagnostics["l2_sp"])
+            diagnostic_proof["l2_sp"] = regularizer.metadata()
     hard_loss = supervised.FocalLoss(config["training"]["focal_gamma"], config["training"]["focal_scale"])
     loader = _loader(split, "train", teacher.adapter.preprocess, student.preprocess, config,
                      torch.Generator().manual_seed(config["seed"]), include_teacher=kd is not None)
+    if diagnostics is not None:
+        clean_loader = _clean_train_loader(split, loader.dataset.metadata(), config)
+        diagnostic_proof["clean_train_eval"] = _clean_loader_metadata(
+            clean_loader, "train", loader.dataset.metadata(), private_generator=True)
     batch = next(iter(loader))
     values = _batch_loss(student, teacher, kd, batch, hard_loss, device)
+    if regularizer is not None:
+        raw, penalty = regularizer.losses(student)
+        values.update(l2_sp=raw, l2_sp_penalty=penalty, total=values["total"] + penalty)
     values["total"].backward()
     backbone_gradients = [parameter.grad for name, parameter in student.named_parameters()
                           if not name.startswith("encoder.head.") and parameter.grad is not None]
@@ -620,7 +827,8 @@ def check(config, project, condition="distillation"):
     directory = _new_suite(config, kind="check")
     snapshot = directory / "roundtrip.pt"
     supervised._torch_save(snapshot, _student_payload(student, config, supervised._split_hash(split),
-                            condition, initial_hash, info, loader.dataset.metadata()))
+                            condition, initial_hash, info, loader.dataset.metadata(),
+                            diagnostics_proof=diagnostic_proof))
     restored, _ = load_student_checkpoint(snapshot, device)
     roundtrip_state = _verify_roundtrip_state(student, restored)
     with torch.no_grad():
@@ -639,6 +847,12 @@ def check(config, project, condition="distillation"):
               "teacher": info,
               "student_trainable_parameters": sum(p.numel() for p in student.parameters() if p.requires_grad),
               "distillation_trainable_parameters": sum(p.numel() for p in kd.parameters() if p.requires_grad) if kd is not None else 0}
+    if diagnostics is not None:
+        result.update(diagnostics=diagnostic_proof, evaluation_phase="validation_only", test_evaluated=False)
+        result.update({key: diagnostic_proof[key] for key in (
+            "initial_backbone_state_sha256", "initial_head_state_sha256", "distillation_initial_state_sha256")})
+        if regularizer is not None:
+            diagnostic_proof["l2_sp"] = regularizer.metadata()
     supervised._json(directory / "check.json", result)
     print(json.dumps({key: value for key, value in result.items()
                       if key not in {"config", "effective_training", "teacher", "model_metadata"}},
@@ -648,14 +862,18 @@ def check(config, project, condition="distillation"):
 
 
 def _metric_row(receipt):
-    metrics = receipt["test_patient"]
+    diagnostic = receipt.get("evaluation_phase") == "validation_only"
+    metrics = receipt["validation_patient"] if diagnostic else receipt["test_patient"]
     ci = receipt.get("roc_auc_ci") or {}
-    return {"condition": receipt["condition"], "student_mode": receipt.get("student_mode", "full_finetune"),
+    row = {"condition": receipt["condition"], "student_mode": receipt.get("student_mode", "full_finetune"),
             "seed": receipt["seed"],
             "val_auc": receipt["best_val_patient_roc_auc"], "roc_auc": metrics["roc_auc"],
             "roc_ci_lower": ci.get("lower"), "roc_ci_upper": ci.get("upper"),
             "pr_auc": metrics["pr_auc"], "ap": metrics["average_precision"],
             "sensitivity": metrics["sensitivity"], "specificity": metrics["specificity"]}
+    if diagnostic:
+        row["evaluation_phase"] = "validation_only"
+    return row
 
 
 def show_metrics(config, project, suite=None):
@@ -673,9 +891,9 @@ def show_metrics(config, project, suite=None):
             continue
         found = True
         print(f"\nBatch: {batch}")
-        names = list(rows[0])
-        formatted = [[str(row[key]) if key in {"condition", "student_mode", "seed"} else
-                      ("-" if row[key] is None else f"{row[key]:.4f}") for key in names] for row in rows]
+        names = list(dict.fromkeys(key for row in rows for key in row))
+        formatted = [[str(row.get(key, "-")) if key in {"condition", "student_mode", "seed", "evaluation_phase"} else
+                      ("-" if row.get(key) is None else f"{row[key]:.4f}") for key in names] for row in rows]
         widths = [max(len(name), *(len(row[index]) for row in formatted)) for index, name in enumerate(names)]
         print("  ".join(name.ljust(widths[index]) for index, name in enumerate(names)))
         for row in formatted:
